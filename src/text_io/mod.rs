@@ -85,6 +85,20 @@ impl TextIoService {
             self.copy_with_system_backends(text).await?;
         }
 
+        // Also set primary selection (Shift+Insert paste on Wayland).
+        if which("wl-copy").is_ok() {
+            if let Ok(mut child) = Command::new("wl-copy")
+                .args(["--type", "text/plain", "--primary"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+            }
+        }
+
         if let Some(prev) = previous {
             debug!("Previous clipboard content preserved: {} chars", prev.len());
         }
@@ -206,24 +220,70 @@ impl TextIoService {
         info!("Simulating paste from clipboard");
 
         if which("ydotool").is_ok() {
+            debug!("Trying ydotool paste (Ctrl+Shift+V)");
+            if let Ok(output) = Command::new("ydotool")
+                .args(["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+                .output()
+            {
+                if output.status.success() {
+                    debug!("Successfully pasted with ydotool (Ctrl+Shift+V)");
+                    return Ok(());
+                }
+                debug!(
+                    "ydotool Ctrl+Shift+V failed: status={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+            if desktop == "KDE" {
+                if which("ydotool").is_ok() {
+                    debug!("Trying ydotool paste (Shift+Insert)");
+                    if let Ok(output) = Command::new("ydotool")
+                        .args(["key", "42:1", "110:1", "110:0", "42:0"])
+                        .output()
+                    {
+                        if output.status.success() {
+                            debug!("Successfully pasted with ydotool (Shift+Insert)");
+                            return Ok(());
+                        }
+                        debug!(
+                            "ydotool Shift+Insert failed: status={:?} stderr={}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+            }
+        }
+
+        if which("ydotool").is_ok() {
+            debug!("Trying ydotool paste (Ctrl+V)");
             if let Ok(output) = Command::new("ydotool")
                 .args(["key", "29:1", "47:1", "47:0", "29:0"])
                 .output()
             {
                 if output.status.success() {
-                    debug!("Successfully pasted with ydotool");
+                    debug!("Successfully pasted with ydotool (Ctrl+V)");
                     return Ok(());
                 }
+                debug!(
+                    "ydotool Ctrl+V failed: status={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
 
         if which("wtype").is_ok() {
             if let Ok(output) = Command::new("wtype")
-                .args(["-M", "ctrl", "-P", "v", "-m", "ctrl", "-p", "v"])
+                .args(["-M", "ctrl", "-M", "shift", "-P", "v", "-m", "shift", "-m", "ctrl"])
                 .output()
             {
                 if output.status.success() {
-                    debug!("Successfully pasted with wtype");
+                    debug!("Successfully pasted with wtype (Ctrl+Shift+V)");
                     return Ok(());
                 } else {
                     debug!("wtype paste failed, trying other methods");
@@ -236,25 +296,6 @@ impl TextIoService {
                 if output.status.success() {
                     debug!("Successfully pasted with xdotool");
                     return Ok(());
-                }
-            }
-        }
-
-        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-            if desktop == "KDE" {
-                if let Ok(output) = Command::new("qdbus")
-                    .args([
-                        "org.kde.klipper",
-                        "/klipper",
-                        "org.kde.klipper.klipper.invokeAction",
-                        "paste",
-                    ])
-                    .output()
-                {
-                    if output.status.success() {
-                        debug!("Successfully pasted with KDE Klipper");
-                        return Ok(());
-                    }
                 }
             }
         }
@@ -282,6 +323,10 @@ impl InjectionMethod {
                 "wtype" if which("wtype").is_ok() => {
                     info!("Using wtype for text injection (per config)");
                     return InjectionMethod::Wtype;
+                }
+                "clipboard" => {
+                    info!("Using clipboard-based injection (per config)");
+                    return InjectionMethod::Clipboard;
                 }
                 other => {
                     warn!(
@@ -323,7 +368,7 @@ const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
     ClipboardBackend {
         name: "wl-copy",
         copy_cmd: "wl-copy",
-        copy_args: &[],
+        copy_args: &["--type", "text/plain"],
         use_stdin: true,
     },
     ClipboardBackend {

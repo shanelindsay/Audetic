@@ -2,6 +2,7 @@ use crate::config::UiConfig;
 use anyhow::Result;
 use std::process::Command;
 use tracing::{debug, info, warn};
+use which::which;
 
 #[derive(Clone)]
 pub struct Indicator {
@@ -38,9 +39,11 @@ impl Indicator {
     pub async fn show_recording(&self) -> Result<()> {
         info!("Showing recording indicator");
 
-        if let Err(e) = self.hyprland_notify("󰻃 Recording...") {
-            debug!("Hyprland notification failed: {}", e);
-        }
+        self.notify_with_icon(
+            "Recording...",
+            "/home/sl/.local/share/icons/audetic-mic-red.svg",
+            None,
+        );
 
         // Play recording start sound
         self.play_sound("start").await;
@@ -51,9 +54,7 @@ impl Indicator {
     pub async fn show_processing(&self) -> Result<()> {
         info!("Showing processing indicator");
 
-        if let Err(e) = self.hyprland_notify("󰦖 Processing...") {
-            debug!("Hyprland notification failed: {}", e);
-        }
+        self.notify_with_icon("Processing...", "view-refresh", None);
 
         // Play recording stop sound
         self.play_sound("stop").await;
@@ -70,9 +71,7 @@ impl Indicator {
             text.to_string()
         };
 
-        if let Err(e) = self.hyprland_notify(&format!("󰸞 {preview}")) {
-            debug!("Hyprland notification failed: {}", e);
-        }
+        self.notify_with_icon(&format!("{preview}"), "dialog-information", None);
 
         // Play completion sound
         self.play_sound("complete").await;
@@ -83,9 +82,7 @@ impl Indicator {
     pub async fn show_error(&self, error: &str) -> Result<()> {
         warn!("Showing error: {}", error);
 
-        if let Err(e) = self.hyprland_notify(&format!("Error: {error}")) {
-            debug!("Hyprland notification failed: {}", e);
-        }
+        self.notify_with_icon(&format!("Error: {error}"), "dialog-error", Some("critical"));
 
         Ok(())
     }
@@ -96,6 +93,39 @@ impl Indicator {
             .output()?;
 
         Ok(())
+    }
+
+    fn kde_notify(&self, title: &str, icon: Option<&str>, urgency: Option<&str>) -> Result<()> {
+        let mut cmd = Command::new("notify-send");
+        cmd.args(["-a", "Audetic", "-t", "3000"]);
+        if let Some(level) = urgency {
+            cmd.args(["-u", level]);
+        }
+        if let Some(icon_name) = icon {
+            cmd.args(["-i", icon_name]);
+        }
+        cmd.arg(title);
+        cmd.output()?;
+        Ok(())
+    }
+
+    fn notify_with_icon(&self, title: &str, icon: &str, urgency: Option<&str>) {
+        if which("hyprctl").is_ok() {
+            if let Err(e) = self.hyprland_notify(title) {
+                debug!("Hyprland notification failed: {}", e);
+            } else {
+                return;
+            }
+        }
+
+        if which("notify-send").is_ok() {
+            let icon_opt = if icon.is_empty() { None } else { Some(icon) };
+            if let Err(e) = self.kde_notify(title, icon_opt, urgency) {
+                debug!("notify-send failed: {}", e);
+            }
+        } else {
+            debug!("No notification backend available");
+        }
     }
 
     async fn play_sound(&self, sound_type: &str) {
