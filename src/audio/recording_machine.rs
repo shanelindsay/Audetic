@@ -158,6 +158,7 @@ impl Default for JobOptions {
 pub struct BehaviorOptions {
     pub auto_paste: bool,
     pub delete_audio_files: bool,
+    pub append_newline: bool,
 }
 
 /// Context for running a transcription processing task.
@@ -169,6 +170,7 @@ struct ProcessingContext {
     temp_path: PathBuf,
     job_id: Option<String>,
     delete_audio_files: bool,
+    append_newline: bool,
 }
 
 pub struct RecordingMachine {
@@ -333,6 +335,7 @@ impl RecordingMachine {
             temp_path,
             job_id,
             delete_audio_files: self.behavior.delete_audio_files,
+            append_newline: self.behavior.append_newline,
         };
 
         tokio::spawn(async move {
@@ -380,7 +383,12 @@ impl RecordingMachine {
                     }
 
                     if ctx.job_options.auto_paste {
-                        if let Err(e) = ctx.text_io.inject_text(&text).await {
+                        let inject_text = if ctx.append_newline {
+                            format!("{text}\n")
+                        } else {
+                            text.clone()
+                        };
+                        if let Err(e) = ctx.text_io.inject_text(&inject_text).await {
                             error!("Failed to inject text: {}", e);
                             // Only try paste fallback if we copied to clipboard
                             if ctx.job_options.copy_to_clipboard {

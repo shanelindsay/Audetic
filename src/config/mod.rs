@@ -55,6 +55,8 @@ pub struct BehaviorConfig {
     pub delete_audio_files: bool,
     #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
+    #[serde(default)]
+    pub append_newline: bool,
 }
 
 fn default_audio_feedback() -> bool {
@@ -110,6 +112,7 @@ impl Default for BehaviorConfig {
             preserve_clipboard: false,
             delete_audio_files: true,
             audio_feedback: true,
+            append_newline: false,
         }
     }
 }

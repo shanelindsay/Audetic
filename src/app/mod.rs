@@ -42,6 +42,7 @@ pub async fn run_service() -> Result<()> {
         BehaviorOptions {
             auto_paste: config.behavior.auto_paste,
             delete_audio_files: config.behavior.delete_audio_files,
+            append_newline: config.behavior.append_newline,
         },
         status_handle.clone(),
     );

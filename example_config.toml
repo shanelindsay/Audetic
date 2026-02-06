@@ -36,3 +36,4 @@ auto_paste = true
 preserve_clipboard = false
 delete_audio_files = true
 audio_feedback = true
+append_newline = false         # Append newline to injected text (if auto_paste)
