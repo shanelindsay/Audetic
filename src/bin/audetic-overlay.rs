@@ -40,6 +40,11 @@ impl Default for OverlayState {
 struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     toggle_url: String,
+    mode_label: String,
+    commit_label: String,
+    hotkey_hint: String,
+    ptt_button_down: bool,
+    ptt_owns_session: bool,
     opacity: f32,
     show_meter: bool,
 }
@@ -48,12 +53,20 @@ impl OverlayApp {
     fn new(
         state: Arc<Mutex<OverlayState>>,
         toggle_url: String,
+        mode_label: String,
+        commit_label: String,
+        hotkey_hint: String,
         opacity: f32,
         show_meter: bool,
     ) -> Self {
         Self {
             state,
             toggle_url,
+            mode_label,
+            commit_label,
+            hotkey_hint,
+            ptt_button_down: false,
+            ptt_owns_session: false,
             opacity,
             show_meter,
         }
@@ -97,9 +110,18 @@ impl eframe::App for OverlayApp {
                         } else {
                             egui::Color32::from_rgb(70, 180, 95)
                         };
+                        let button_text = if is_recording {
+                            egui::RichText::new(button_label)
+                                .strong()
+                                .color(egui::Color32::WHITE)
+                        } else {
+                            egui::RichText::new(button_label)
+                                .strong()
+                                .color(egui::Color32::BLACK)
+                        };
                         let clicked = ui
                             .add(
-                                egui::Button::new(button_label)
+                                egui::Button::new(button_text)
                                     .fill(button_fill)
                                     .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
                             )
@@ -113,6 +135,53 @@ impl eframe::App for OverlayApp {
                             request_toggle(self.toggle_url.clone(), self.state.clone());
                         }
                     });
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    draw_badge(
+                        ui,
+                        &format!("Mode: {}", self.mode_label),
+                        egui::Color32::from_rgb(63, 81, 181),
+                        egui::Color32::WHITE,
+                    );
+                    draw_badge(
+                        ui,
+                        &format!("Commit: {}", self.commit_label),
+                        egui::Color32::from_rgb(56, 142, 60),
+                        egui::Color32::BLACK,
+                    );
+                    draw_badge(
+                        ui,
+                        &format!("Hotkey: {}", self.hotkey_hint),
+                        egui::Color32::from_rgb(96, 125, 139),
+                        egui::Color32::WHITE,
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    let hold_button = ui.add(
+                        egui::Button::new(egui::RichText::new("Hold To Talk").strong())
+                            .fill(egui::Color32::from_rgb(245, 203, 66))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                    );
+
+                    let is_down = hold_button.is_pointer_button_down_on();
+                    let is_recording = snapshot.phase == "recording";
+
+                    if is_down && !self.ptt_button_down && !is_recording {
+                        request_toggle(self.toggle_url.clone(), self.state.clone());
+                        self.ptt_owns_session = true;
+                    }
+
+                    if !is_down && self.ptt_button_down {
+                        if self.ptt_owns_session && is_recording {
+                            request_toggle(self.toggle_url.clone(), self.state.clone());
+                        }
+                        self.ptt_owns_session = false;
+                    }
+
+                    self.ptt_button_down = is_down;
+                    ui.label("Press and hold for push-to-talk.");
                 });
 
                 if self.show_meter {
@@ -167,6 +236,9 @@ impl eframe::App for OverlayApp {
 struct OverlayRuntimeConfig {
     url: String,
     toggle_url: String,
+    mode_label: String,
+    commit_label: String,
+    hotkey_hint: String,
     always_on_top: bool,
     width: f32,
     height: f32,
@@ -175,11 +247,44 @@ struct OverlayRuntimeConfig {
 }
 
 impl OverlayRuntimeConfig {
-    fn from_overlay_config(cfg: &OverlayConfig) -> Self {
+    fn from_config(config: &Config) -> Self {
+        let overlay_cfg: &OverlayConfig = &config.overlay;
+        let toggle_url = derive_toggle_url(&overlay_cfg.url);
+        let mode_label = if config.streaming.enabled {
+            "Streaming".to_string()
+        } else {
+            "Batch".to_string()
+        };
+        let commit_label = match config.streaming.commit_target.as_str() {
+            "text_io" => "Auto-paste".to_string(),
+            "clipboard" => "Clipboard".to_string(),
+            "none" => "None".to_string(),
+            other => other.to_string(),
+        };
+
+        Self {
+            url: overlay_cfg.url.clone(),
+            toggle_url,
+            mode_label,
+            commit_label,
+            hotkey_hint: "Super+R".to_string(),
+            always_on_top: overlay_cfg.always_on_top,
+            width: overlay_cfg.width as f32,
+            height: overlay_cfg.height as f32,
+            opacity: overlay_cfg.opacity,
+            show_meter: overlay_cfg.show_meter,
+        }
+    }
+
+    fn fallback_default() -> Self {
+        let cfg = OverlayConfig::default();
         let toggle_url = derive_toggle_url(&cfg.url);
         Self {
-            url: cfg.url.clone(),
+            url: cfg.url,
             toggle_url,
+            mode_label: "Streaming".to_string(),
+            commit_label: "Clipboard".to_string(),
+            hotkey_hint: "Super+R".to_string(),
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
             height: cfg.height as f32,
@@ -191,9 +296,19 @@ impl OverlayRuntimeConfig {
 
 fn load_runtime_config() -> OverlayRuntimeConfig {
     match Config::load() {
-        Ok(config) => OverlayRuntimeConfig::from_overlay_config(&config.overlay),
-        Err(_) => OverlayRuntimeConfig::from_overlay_config(&OverlayConfig::default()),
+        Ok(config) => OverlayRuntimeConfig::from_config(&config),
+        Err(_) => OverlayRuntimeConfig::fallback_default(),
     }
+}
+
+fn draw_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_color: egui::Color32) {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(text_color).strong());
+        });
 }
 
 fn dbfs_to_level(dbfs: f32) -> f32 {
@@ -522,6 +637,9 @@ fn run() -> Result<(), DynError> {
     let opacity = runtime_cfg.opacity;
     let show_meter = runtime_cfg.show_meter;
     let toggle_url = runtime_cfg.toggle_url.clone();
+    let mode_label = runtime_cfg.mode_label.clone();
+    let commit_label = runtime_cfg.commit_label.clone();
+    let hotkey_hint = runtime_cfg.hotkey_hint.clone();
     eframe::run_native(
         "Audetic Overlay",
         native_options,
@@ -529,6 +647,9 @@ fn run() -> Result<(), DynError> {
             Ok(Box::new(OverlayApp::new(
                 state.clone(),
                 toggle_url.clone(),
+                mode_label.clone(),
+                commit_label.clone(),
+                hotkey_hint.clone(),
                 opacity,
                 show_meter,
             )))
