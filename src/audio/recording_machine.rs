@@ -143,6 +143,10 @@ pub struct JobOptions {
     pub copy_to_clipboard: bool,
     /// Whether to auto-paste/inject text into the focused app (default: from config)
     pub auto_paste: bool,
+    /// Whether to append a newline (Enter) after injected text (default: from config)
+    pub append_newline: Option<bool>,
+    /// Whether to send a real Enter keypress after auto-paste (default: false)
+    pub send_enter: Option<bool>,
 }
 
 impl Default for JobOptions {
@@ -150,6 +154,8 @@ impl Default for JobOptions {
         Self {
             copy_to_clipboard: true,
             auto_paste: true,
+            append_newline: None,
+            send_enter: None,
         }
     }
 }
@@ -171,6 +177,7 @@ struct ProcessingContext {
     job_id: Option<String>,
     delete_audio_files: bool,
     append_newline: bool,
+    send_enter: bool,
 }
 
 pub struct RecordingMachine {
@@ -233,6 +240,8 @@ impl RecordingMachine {
                 let job_options = options.unwrap_or(JobOptions {
                     copy_to_clipboard: true,
                     auto_paste: self.behavior.auto_paste,
+                    append_newline: Some(self.behavior.append_newline),
+                    send_enter: Some(false),
                 });
 
                 info!(
@@ -262,6 +271,8 @@ impl RecordingMachine {
                 let job_options = current.current_job_options.unwrap_or(JobOptions {
                     copy_to_clipboard: true,
                     auto_paste: self.behavior.auto_paste,
+                    append_newline: Some(self.behavior.append_newline),
+                    send_enter: Some(false),
                 });
                 info!(
                     "RecordingMachine: stopping recording and processing job_id={:?}, options={:?}",
@@ -335,7 +346,10 @@ impl RecordingMachine {
             temp_path,
             job_id,
             delete_audio_files: self.behavior.delete_audio_files,
-            append_newline: self.behavior.append_newline,
+            append_newline: job_options
+                .append_newline
+                .unwrap_or(self.behavior.append_newline),
+            send_enter: job_options.send_enter.unwrap_or(false),
         };
 
         tokio::spawn(async move {
@@ -393,6 +407,13 @@ impl RecordingMachine {
                             // Only try paste fallback if we copied to clipboard
                             if ctx.job_options.copy_to_clipboard {
                                 let _ = ctx.text_io.paste_from_clipboard().await;
+                            }
+                        }
+
+                        if ctx.send_enter {
+                            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                            if let Err(e) = ctx.text_io.send_enter_key().await {
+                                warn!("Failed to send Enter key: {}", e);
                             }
                         }
                     }
@@ -546,6 +567,8 @@ mod tests {
         let options = JobOptions {
             copy_to_clipboard: false,
             auto_paste: false,
+            append_newline: None,
+            send_enter: None,
         };
         handle
             .start_job("test-job-custom".to_string(), options)
@@ -558,6 +581,7 @@ mod tests {
         let job_options = status.current_job_options.unwrap();
         assert!(!job_options.copy_to_clipboard);
         assert!(!job_options.auto_paste);
+        assert_eq!(job_options.send_enter, None);
     }
 
     #[tokio::test]
@@ -690,6 +714,8 @@ mod tests {
         let options = JobOptions::default();
         assert!(options.copy_to_clipboard);
         assert!(options.auto_paste);
+        assert_eq!(options.append_newline, None);
+        assert_eq!(options.send_enter, None);
     }
 
     #[test]
@@ -697,16 +723,22 @@ mod tests {
         let options = JobOptions {
             copy_to_clipboard: false,
             auto_paste: true,
+            append_newline: Some(true),
+            send_enter: Some(true),
         };
 
         let json = serde_json::to_string(&options).unwrap();
         assert!(json.contains("\"copy_to_clipboard\":false"));
         assert!(json.contains("\"auto_paste\":true"));
+        assert!(json.contains("\"append_newline\":true"));
+        assert!(json.contains("\"send_enter\":true"));
 
         // Test deserialization
         let parsed: JobOptions = serde_json::from_str(&json).unwrap();
         assert!(!parsed.copy_to_clipboard);
         assert!(parsed.auto_paste);
+        assert_eq!(parsed.append_newline, Some(true));
+        assert_eq!(parsed.send_enter, Some(true));
     }
 
     #[test]

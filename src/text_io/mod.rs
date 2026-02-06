@@ -131,6 +131,52 @@ impl TextIoService {
         self.simulate_paste().await
     }
 
+    pub async fn send_enter_key(&self) -> Result<()> {
+        info!("Sending Enter key");
+
+        if which("ydotool").is_ok() {
+            if let Ok(output) = Command::new("ydotool")
+                .args(["key", "28:1", "28:0"])
+                .output()
+            {
+                if output.status.success() {
+                    debug!("Sent Enter with ydotool");
+                    return Ok(());
+                }
+                debug!(
+                    "ydotool Enter failed: status={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        if which("wtype").is_ok() {
+            if let Ok(output) = Command::new("wtype").args(["-k", "Return"]).output() {
+                if output.status.success() {
+                    debug!("Sent Enter with wtype");
+                    return Ok(());
+                }
+                debug!(
+                    "wtype Return failed: status={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        if which("xdotool").is_ok() {
+            if let Ok(output) = Command::new("xdotool").args(["key", "Return"]).output() {
+                if output.status.success() {
+                    debug!("Sent Enter with xdotool");
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(anyhow!("Unable to send Enter key with available backends"))
+    }
+
     async fn try_with_clipboard_fallback<F>(&self, text: &str, inject_fn: F) -> Result<()>
     where
         F: Fn(&str) -> Result<()>,

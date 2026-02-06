@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use audetic::config::{Config, OverlayConfig};
 use audetic::streaming::events::StreamEvent;
+use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
 
 type DynError = Box<dyn std::error::Error>;
@@ -41,10 +42,16 @@ struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     toggle_url: String,
     engine_mode: EngineMode,
-    hotkey_hint: String,
+    streaming_model_label: String,
+    streaming_source_label: String,
+    batch_model_label: String,
+    batch_source_label: String,
+    mic_label: String,
     control_mode: InputControlMode,
     copy_to_clipboard: bool,
     auto_paste: bool,
+    append_newline: bool,
+    send_enter: bool,
     ptt_button_down: bool,
     ptt_owns_session: bool,
     ptt_start_requested: bool,
@@ -60,10 +67,16 @@ struct OverlayApp {
 struct OverlayAppUiConfig {
     toggle_url: String,
     engine_mode: EngineMode,
-    hotkey_hint: String,
+    streaming_model_label: String,
+    streaming_source_label: String,
+    batch_model_label: String,
+    batch_source_label: String,
+    mic_label: String,
     control_mode: InputControlMode,
     copy_to_clipboard: bool,
     auto_paste: bool,
+    append_newline: bool,
+    send_enter: bool,
     opacity: f32,
     show_meter: bool,
 }
@@ -72,15 +85,6 @@ struct OverlayAppUiConfig {
 enum InputControlMode {
     Toggle,
     Hold,
-}
-
-impl InputControlMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Toggle => "Tap",
-            Self::Hold => "Hold",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,16 +113,59 @@ impl EngineMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    CopyAndPaste,
+    CopyOnly,
+    PasteAndEnter,
+    NoOutput,
+}
+
+impl OutputMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CopyAndPaste => "Copy + paste",
+            Self::CopyOnly => "Copy only",
+            Self::PasteAndEnter => "Paste + Enter",
+            Self::NoOutput => "No output",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::CopyAndPaste => Self::PasteAndEnter,
+            Self::PasteAndEnter => Self::CopyOnly,
+            Self::CopyOnly => Self::NoOutput,
+            Self::NoOutput => Self::CopyAndPaste,
+        }
+    }
+
+    fn flags(self) -> (bool, bool, bool, bool) {
+        match self {
+            Self::CopyAndPaste => (true, true, false, false),
+            Self::CopyOnly => (true, false, false, false),
+            Self::PasteAndEnter => (true, true, false, true),
+            Self::NoOutput => (false, false, false, false),
+        }
+    }
+}
+
 impl OverlayApp {
     fn new(state: Arc<Mutex<OverlayState>>, ui_cfg: OverlayAppUiConfig) -> Self {
         Self {
             state,
             toggle_url: ui_cfg.toggle_url,
             engine_mode: ui_cfg.engine_mode,
-            hotkey_hint: ui_cfg.hotkey_hint,
+            streaming_model_label: ui_cfg.streaming_model_label,
+            streaming_source_label: ui_cfg.streaming_source_label,
+            batch_model_label: ui_cfg.batch_model_label,
+            batch_source_label: ui_cfg.batch_source_label,
+            mic_label: ui_cfg.mic_label,
             control_mode: ui_cfg.control_mode,
             copy_to_clipboard: ui_cfg.copy_to_clipboard,
             auto_paste: ui_cfg.auto_paste,
+            append_newline: ui_cfg.append_newline,
+            send_enter: ui_cfg.send_enter,
             ptt_button_down: false,
             ptt_owns_session: false,
             ptt_start_requested: false,
@@ -164,40 +211,61 @@ impl OverlayApp {
         let body = ToggleBody {
             copy_to_clipboard: Some(self.copy_to_clipboard),
             auto_paste: Some(self.auto_paste),
+            append_newline: Some(self.append_newline),
+            send_enter: Some(self.send_enter),
         };
         request_toggle(self.toggle_url.clone(), self.state.clone(), Some(body));
     }
 
     fn cycle_final_action_mode(&mut self) {
-        match (self.copy_to_clipboard, self.auto_paste) {
-            (true, true) => {
-                self.copy_to_clipboard = true;
-                self.auto_paste = false;
-            }
-            (true, false) => {
-                self.copy_to_clipboard = false;
-                self.auto_paste = true;
-            }
-            (false, true) => {
-                self.copy_to_clipboard = false;
-                self.auto_paste = false;
-            }
-            (false, false) => {
-                self.copy_to_clipboard = true;
-                self.auto_paste = true;
-            }
-        }
+        let next_mode = output_mode_from_flags(
+            self.copy_to_clipboard,
+            self.auto_paste,
+            self.append_newline,
+            self.send_enter,
+        )
+        .next();
+        let (copy_to_clipboard, auto_paste, append_newline, send_enter) = next_mode.flags();
+        self.copy_to_clipboard = copy_to_clipboard;
+        self.auto_paste = auto_paste;
+        self.append_newline = append_newline;
+        self.send_enter = send_enter;
 
         let mut guard = self.state.lock().expect("overlay state lock poisoned");
-        guard.status_line = format!(
-            "Final action set: {}",
-            format_run_output_mode(self.copy_to_clipboard, self.auto_paste)
-        );
+        guard.status_line = format!("Final action set: {}", next_mode.label());
     }
 
     fn cycle_engine_mode(&mut self) {
         self.engine_mode = self.engine_mode.toggled();
         persist_engine_mode(self.engine_mode, self.state.clone());
+    }
+
+    fn active_model_label(&self) -> &str {
+        match self.engine_mode {
+            EngineMode::Streaming => &self.streaming_model_label,
+            EngineMode::Batch => &self.batch_model_label,
+        }
+    }
+
+    fn active_source_label(&self) -> &str {
+        match self.engine_mode {
+            EngineMode::Streaming => &self.streaming_source_label,
+            EngineMode::Batch => &self.batch_source_label,
+        }
+    }
+}
+
+fn output_mode_from_flags(
+    copy_to_clipboard: bool,
+    auto_paste: bool,
+    append_newline: bool,
+    send_enter: bool,
+) -> OutputMode {
+    match (copy_to_clipboard, auto_paste, append_newline, send_enter) {
+        (true, true, _, true) => OutputMode::PasteAndEnter,
+        (true, true, _, false) => OutputMode::CopyAndPaste,
+        (true, false, _, _) => OutputMode::CopyOnly,
+        _ => OutputMode::NoOutput,
     }
 }
 
@@ -205,6 +273,8 @@ impl OverlayApp {
 struct ToggleBody {
     copy_to_clipboard: Option<bool>,
     auto_paste: Option<bool>,
+    append_newline: Option<bool>,
+    send_enter: Option<bool>,
 }
 
 impl eframe::App for OverlayApp {
@@ -226,16 +296,6 @@ impl eframe::App for OverlayApp {
             .frame(panel_frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Audetic Live");
-
-                    let status_color = if snapshot.connected {
-                        egui::Color32::from_rgb(77, 214, 114)
-                    } else {
-                        egui::Color32::from_rgb(232, 99, 87)
-                    };
-                    ui.colored_label(status_color, "●");
-                    ui.label(format!("{} | {}", snapshot.phase, snapshot.status_line));
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let is_recording = snapshot.phase == "recording";
                         let button_label = if is_recording { "Stop" } else { "Start" };
@@ -277,15 +337,30 @@ impl eframe::App for OverlayApp {
                     }
                     draw_badge(
                         ui,
-                        &format!("State: {}", snapshot.phase),
-                        egui::Color32::from_rgb(84, 110, 122),
+                        self.active_model_label(),
+                        egui::Color32::from_rgb(40, 53, 147),
                         egui::Color32::WHITE,
                     );
+                    draw_badge(
+                        ui,
+                        self.active_source_label(),
+                        egui::Color32::from_rgb(2, 119, 189),
+                        egui::Color32::WHITE,
+                    );
+                });
+
+                ui.horizontal_wrapped(|ui| {
                     if draw_clickable_badge(
                         ui,
                         &format!(
                             "Final action: {}",
-                            format_run_output_mode(self.copy_to_clipboard, self.auto_paste)
+                            output_mode_from_flags(
+                                self.copy_to_clipboard,
+                                self.auto_paste,
+                                self.append_newline,
+                                self.send_enter,
+                            )
+                            .label()
                         ),
                         egui::Color32::from_rgb(56, 142, 60),
                         egui::Color32::BLACK,
@@ -294,20 +369,11 @@ impl eframe::App for OverlayApp {
                     }
                     draw_badge(
                         ui,
-                        &format!("Input: {}", self.control_mode.label()),
-                        egui::Color32::from_rgb(121, 85, 72),
-                        egui::Color32::WHITE,
-                    );
-                    draw_badge(
-                        ui,
-                        &format!("Hotkey: {}", self.hotkey_hint),
-                        egui::Color32::from_rgb(96, 125, 139),
+                        &format!("Mic: {}", self.mic_label),
+                        egui::Color32::from_rgb(69, 90, 100),
                         egui::Color32::WHITE,
                     );
                 });
-                ui.small("Click Engine to switch (service restart required).");
-                ui.small("Click Final action to cycle output mode for next run.");
-
                 ui.horizontal(|ui| {
                     ui.label("Control mode:");
                     if ui
@@ -388,9 +454,14 @@ impl eframe::App for OverlayApp {
                 }
 
                 if self.show_meter {
+                    let meter_fill = if snapshot.phase == "recording" {
+                        egui::Color32::from_rgb(220, 72, 72)
+                    } else {
+                        egui::Color32::from_rgb(66, 133, 244)
+                    };
                     let meter = egui::ProgressBar::new(snapshot.meter_level)
-                        .show_percentage()
-                        .text("Mic level");
+                        .fill(meter_fill)
+                        .show_percentage();
                     ui.add(meter);
 
                     if snapshot.clipping {
@@ -398,29 +469,21 @@ impl eframe::App for OverlayApp {
                     }
                 }
 
-                ui.separator();
-                ui.label("Live partial");
-                if snapshot.partial_text.trim().is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("...").italics());
-                    ui.add_space(6.0);
-                } else {
-                    ui.label(egui::RichText::new(snapshot.partial_text).size(18.0));
+                if !snapshot.partial_text.trim().is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(snapshot.partial_text)
+                            .size(24.0)
+                            .color(egui::Color32::from_rgb(255, 224, 130)),
+                    );
                 }
-
-                ui.separator();
-                ui.label("Recent final segments");
 
                 egui::ScrollArea::vertical()
                     .max_height(110.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if snapshot.recent_finals.is_empty() {
-                            ui.label(egui::RichText::new("No final transcript yet").italics());
-                        } else {
-                            for line in snapshot.recent_finals {
-                                ui.label(line);
-                            }
+                        for line in snapshot.recent_finals.into_iter().rev() {
+                            ui.label(line);
                         }
                     });
 
@@ -440,10 +503,16 @@ struct OverlayRuntimeConfig {
     url: String,
     toggle_url: String,
     engine_mode: EngineMode,
-    hotkey_hint: String,
+    streaming_model_label: String,
+    streaming_source_label: String,
+    batch_model_label: String,
+    batch_source_label: String,
+    mic_label: String,
     control_mode: InputControlMode,
     copy_to_clipboard: bool,
     auto_paste: bool,
+    append_newline: bool,
+    send_enter: bool,
     always_on_top: bool,
     width: f32,
     height: f32,
@@ -460,15 +529,36 @@ impl OverlayRuntimeConfig {
         } else {
             EngineMode::Batch
         };
+        let streaming_model_label = config.streaming.model.clone();
+        let streaming_source_label = provider_source_label(&config.streaming.provider).to_string();
+        let batch_provider = config
+            .whisper
+            .provider
+            .as_deref()
+            .unwrap_or("audetic-api")
+            .to_string();
+        let batch_model_label = config
+            .whisper
+            .model
+            .clone()
+            .unwrap_or_else(|| "<default>".to_string());
+        let batch_source_label = provider_source_label(&batch_provider).to_string();
+        let mic_label = detect_active_mic_name().unwrap_or_else(|| "Unknown".to_string());
 
         Self {
             url: overlay_cfg.url.clone(),
             toggle_url,
             engine_mode,
-            hotkey_hint: "Super+R".to_string(),
+            streaming_model_label,
+            streaming_source_label,
+            batch_model_label,
+            batch_source_label,
+            mic_label,
             control_mode: InputControlMode::Toggle,
             copy_to_clipboard: true,
             auto_paste: config.behavior.auto_paste,
+            append_newline: config.behavior.append_newline,
+            send_enter: false,
             always_on_top: overlay_cfg.always_on_top,
             width: overlay_cfg.width as f32,
             height: overlay_cfg.height as f32,
@@ -484,10 +574,16 @@ impl OverlayRuntimeConfig {
             url: cfg.url,
             toggle_url,
             engine_mode: EngineMode::Streaming,
-            hotkey_hint: "Super+R".to_string(),
+            streaming_model_label: "voxtral-mini-transcribe-realtime-2602".to_string(),
+            streaming_source_label: "API".to_string(),
+            batch_model_label: "base".to_string(),
+            batch_source_label: "Local".to_string(),
+            mic_label: "Unknown".to_string(),
             control_mode: InputControlMode::Toggle,
             copy_to_clipboard: true,
             auto_paste: true,
+            append_newline: false,
+            send_enter: false,
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
             height: cfg.height as f32,
@@ -497,12 +593,23 @@ impl OverlayRuntimeConfig {
     }
 }
 
-fn format_run_output_mode(copy_to_clipboard: bool, auto_paste: bool) -> &'static str {
-    match (copy_to_clipboard, auto_paste) {
-        (true, true) => "Copy + paste",
-        (true, false) => "Copy only",
-        (false, true) => "Paste only",
-        (false, false) => "No output",
+fn provider_source_label(provider: &str) -> &'static str {
+    match provider {
+        "mistral_realtime" | "openai-api" | "assembly-ai" | "audetic-api" => "API",
+        "openai-cli" | "whisper-cpp" => "Local",
+        _ => "Unknown",
+    }
+}
+
+fn detect_active_mic_name() -> Option<String> {
+    let host = cpal::default_host();
+    let device = host.default_input_device()?;
+    let name = device.name().ok()?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -901,10 +1008,16 @@ fn run() -> Result<(), DynError> {
     let show_meter = runtime_cfg.show_meter;
     let toggle_url = runtime_cfg.toggle_url.clone();
     let engine_mode = runtime_cfg.engine_mode;
-    let hotkey_hint = runtime_cfg.hotkey_hint.clone();
+    let streaming_model_label = runtime_cfg.streaming_model_label.clone();
+    let streaming_source_label = runtime_cfg.streaming_source_label.clone();
+    let batch_model_label = runtime_cfg.batch_model_label.clone();
+    let batch_source_label = runtime_cfg.batch_source_label.clone();
+    let mic_label = runtime_cfg.mic_label.clone();
     let control_mode = runtime_cfg.control_mode;
     let copy_to_clipboard = runtime_cfg.copy_to_clipboard;
     let auto_paste = runtime_cfg.auto_paste;
+    let append_newline = runtime_cfg.append_newline;
+    let send_enter = runtime_cfg.send_enter;
     eframe::run_native(
         "Audetic Overlay",
         native_options,
@@ -912,10 +1025,16 @@ fn run() -> Result<(), DynError> {
             let ui_cfg = OverlayAppUiConfig {
                 toggle_url: toggle_url.clone(),
                 engine_mode,
-                hotkey_hint: hotkey_hint.clone(),
+                streaming_model_label: streaming_model_label.clone(),
+                streaming_source_label: streaming_source_label.clone(),
+                batch_model_label: batch_model_label.clone(),
+                batch_source_label: batch_source_label.clone(),
+                mic_label: mic_label.clone(),
                 control_mode,
                 copy_to_clipboard,
                 auto_paste,
+                append_newline,
+                send_enter,
                 opacity,
                 show_meter,
             };

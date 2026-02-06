@@ -65,6 +65,8 @@ impl StreamingMachine {
                 let job_options = options.unwrap_or(JobOptions {
                     copy_to_clipboard: true,
                     auto_paste: self.behavior.auto_paste,
+                    append_newline: Some(self.behavior.append_newline),
+                    send_enter: Some(false),
                 });
 
                 self.start_stream_session(&job_id, job_options).await?;
@@ -443,7 +445,11 @@ async fn apply_commit(ctx: &StreamTaskContext, text: &str) -> Result<()> {
     }
 
     if commit_target == "text_io" && ctx.job_options.auto_paste {
-        let inject_text = if ctx.behavior.append_newline {
+        let append_newline = ctx
+            .job_options
+            .append_newline
+            .unwrap_or(ctx.behavior.append_newline);
+        let inject_text = if append_newline {
             format!("{}\n", text)
         } else {
             text.to_string()
@@ -453,6 +459,13 @@ async fn apply_commit(ctx: &StreamTaskContext, text: &str) -> Result<()> {
             warn!("Text injection failed: {}", err);
             if ctx.job_options.copy_to_clipboard {
                 let _ = ctx.text_io.paste_from_clipboard().await;
+            }
+        }
+
+        if ctx.job_options.send_enter.unwrap_or(false) {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            if let Err(err) = ctx.text_io.send_enter_key().await {
+                warn!("Enter key send failed: {}", err);
             }
         }
     }

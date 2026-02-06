@@ -28,6 +28,12 @@ pub struct ToggleRequest {
     /// Whether to auto-paste/inject text into the focused app (default: from config)
     #[serde(default)]
     pub auto_paste: Option<bool>,
+    /// Whether to append newline (Enter) after auto-paste (default: from config)
+    #[serde(default)]
+    pub append_newline: Option<bool>,
+    /// Whether to send a real Enter keypress after auto-paste (default: false)
+    #[serde(default)]
+    pub send_enter: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -57,6 +63,8 @@ pub fn router(state: RecordingState) -> Router {
 /// Optional JSON with fields:
 /// - `copy_to_clipboard`: bool - Copy transcription to clipboard
 /// - `auto_paste`: bool - Auto-paste/inject text into focused app
+/// - `append_newline`: bool - Append newline/Enter after injected text
+/// - `send_enter`: bool - Send a real Enter keypress after injected text
 ///
 /// # Response
 /// Returns JSON with recording status and current job information.
@@ -67,10 +75,16 @@ async fn toggle_recording(
     // Parse optional job options from request body
     let job_options = body.and_then(|Json(req)| {
         // Only create JobOptions if at least one field was specified
-        if req.copy_to_clipboard.is_some() || req.auto_paste.is_some() {
+        if req.copy_to_clipboard.is_some()
+            || req.auto_paste.is_some()
+            || req.append_newline.is_some()
+            || req.send_enter.is_some()
+        {
             Some(JobOptions {
                 copy_to_clipboard: req.copy_to_clipboard.unwrap_or(true),
                 auto_paste: req.auto_paste.unwrap_or(true),
+                append_newline: req.append_newline,
+                send_enter: req.send_enter,
             })
         } else {
             None
