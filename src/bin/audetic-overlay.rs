@@ -43,12 +43,31 @@ struct OverlayApp {
     engine_label: String,
     commit_label: String,
     hotkey_hint: String,
+    control_mode: InputControlMode,
     ptt_button_down: bool,
     ptt_owns_session: bool,
+    ptt_start_requested: bool,
+    ptt_pending_stop_after_start: bool,
     ptt_press_started_at: Option<Instant>,
     ptt_activation_delay_ms: u64,
+    last_toggle_request_at: Option<Instant>,
     opacity: f32,
     show_meter: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputControlMode {
+    Toggle,
+    Hold,
+}
+
+impl InputControlMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Toggle => "Tap",
+            Self::Hold => "Hold",
+        }
+    }
 }
 
 impl OverlayApp {
@@ -58,6 +77,7 @@ impl OverlayApp {
         engine_label: String,
         commit_label: String,
         hotkey_hint: String,
+        control_mode: InputControlMode,
         opacity: f32,
         show_meter: bool,
     ) -> Self {
@@ -67,13 +87,50 @@ impl OverlayApp {
             engine_label,
             commit_label,
             hotkey_hint,
+            control_mode,
             ptt_button_down: false,
             ptt_owns_session: false,
+            ptt_start_requested: false,
+            ptt_pending_stop_after_start: false,
             ptt_press_started_at: None,
-            ptt_activation_delay_ms: 180,
+            ptt_activation_delay_ms: 260,
+            last_toggle_request_at: None,
             opacity,
             show_meter,
         }
+    }
+
+    fn reset_hold_state(&mut self) {
+        self.ptt_button_down = false;
+        self.ptt_owns_session = false;
+        self.ptt_start_requested = false;
+        self.ptt_pending_stop_after_start = false;
+        self.ptt_press_started_at = None;
+    }
+
+    fn set_control_mode(&mut self, mode: InputControlMode) {
+        if self.control_mode != mode {
+            self.control_mode = mode;
+            self.reset_hold_state();
+        }
+    }
+
+    fn request_toggle_action(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_toggle_request_at
+            .map(|last| now.duration_since(last) < Duration::from_millis(150))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.last_toggle_request_at = Some(now);
+        {
+            let mut guard = self.state.lock().expect("overlay state lock poisoned");
+            guard.status_line = "Toggling...".to_string();
+        }
+        request_toggle(self.toggle_url.clone(), self.state.clone());
     }
 }
 
@@ -107,36 +164,35 @@ impl eframe::App for OverlayApp {
                     ui.label(format!("{} | {}", snapshot.phase, snapshot.status_line));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let is_recording = snapshot.phase == "recording";
-                        let button_label = if is_recording { "Stop" } else { "Start" };
-                        let button_fill = if is_recording {
-                            egui::Color32::from_rgb(210, 70, 70)
-                        } else {
-                            egui::Color32::from_rgb(70, 180, 95)
-                        };
-                        let button_text = if is_recording {
-                            egui::RichText::new(button_label)
-                                .strong()
-                                .color(egui::Color32::WHITE)
-                        } else {
-                            egui::RichText::new(button_label)
-                                .strong()
-                                .color(egui::Color32::BLACK)
-                        };
-                        let clicked = ui
-                            .add(
-                                egui::Button::new(button_text)
-                                    .fill(button_fill)
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
-                            )
-                            .clicked();
-                        if clicked {
-                            {
-                                let mut guard =
-                                    self.state.lock().expect("overlay state lock poisoned");
-                                guard.status_line = "Toggling...".to_string();
+                        if self.control_mode == InputControlMode::Toggle {
+                            let is_recording = snapshot.phase == "recording";
+                            let button_label = if is_recording { "Stop" } else { "Start" };
+                            let button_fill = if is_recording {
+                                egui::Color32::from_rgb(210, 70, 70)
+                            } else {
+                                egui::Color32::from_rgb(70, 180, 95)
+                            };
+                            let button_text = if is_recording {
+                                egui::RichText::new(button_label)
+                                    .strong()
+                                    .color(egui::Color32::WHITE)
+                            } else {
+                                egui::RichText::new(button_label)
+                                    .strong()
+                                    .color(egui::Color32::BLACK)
+                            };
+                            let clicked = ui
+                                .add(
+                                    egui::Button::new(button_text)
+                                        .fill(button_fill)
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                                )
+                                .clicked();
+                            if clicked {
+                                self.request_toggle_action();
                             }
-                            request_toggle(self.toggle_url.clone(), self.state.clone());
+                        } else {
+                            ui.small("Hold mode active");
                         }
                     });
                 });
@@ -162,55 +218,98 @@ impl eframe::App for OverlayApp {
                     );
                     draw_badge(
                         ui,
+                        &format!("Input: {}", self.control_mode.label()),
+                        egui::Color32::from_rgb(121, 85, 72),
+                        egui::Color32::WHITE,
+                    );
+                    draw_badge(
+                        ui,
                         &format!("Hotkey: {}", self.hotkey_hint),
                         egui::Color32::from_rgb(96, 125, 139),
                         egui::Color32::WHITE,
                     );
                 });
                 ui.small("Engine changes require service restart.");
-                ui.small("Final action applies to final transcript only (not partial text).");
+                ui.small("Final action runs once when a final transcript is produced.");
 
                 ui.horizontal(|ui| {
-                    let hold_button = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("Hold To Talk")
-                                .strong()
-                                .color(egui::Color32::BLACK),
-                        )
-                        .fill(egui::Color32::from_rgb(186, 149, 68))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
-                    );
-
-                    let is_down = hold_button.is_pointer_button_down_on();
-                    let now = Instant::now();
-
-                    if is_down && !self.ptt_button_down {
-                        self.ptt_press_started_at = Some(now);
+                    ui.label("Control mode:");
+                    if ui
+                        .selectable_label(self.control_mode == InputControlMode::Toggle, "Tap")
+                        .clicked()
+                    {
+                        self.set_control_mode(InputControlMode::Toggle);
                     }
-
-                    if is_down && !self.ptt_owns_session {
-                        let elapsed = self
-                            .ptt_press_started_at
-                            .map(|started| now.duration_since(started))
-                            .unwrap_or_default();
-                        let ready = elapsed >= Duration::from_millis(self.ptt_activation_delay_ms);
-                        if ready && snapshot.phase != "recording" {
-                            request_toggle(self.toggle_url.clone(), self.state.clone());
-                            self.ptt_owns_session = true;
-                        }
+                    if ui
+                        .selectable_label(self.control_mode == InputControlMode::Hold, "Hold")
+                        .clicked()
+                    {
+                        self.set_control_mode(InputControlMode::Hold);
                     }
-
-                    if !is_down && self.ptt_button_down {
-                        if self.ptt_owns_session {
-                            request_toggle(self.toggle_url.clone(), self.state.clone());
-                        }
-                        self.ptt_owns_session = false;
-                        self.ptt_press_started_at = None;
-                    }
-
-                    self.ptt_button_down = is_down;
-                    ui.label("Hold to talk (quick taps are ignored).");
                 });
+
+                if self.control_mode == InputControlMode::Hold {
+                    let is_recording = snapshot.phase == "recording";
+                    if self.ptt_start_requested && is_recording {
+                        self.ptt_start_requested = false;
+                        self.ptt_owns_session = true;
+                    }
+                    if self.ptt_pending_stop_after_start && is_recording {
+                        self.request_toggle_action();
+                        self.ptt_pending_stop_after_start = false;
+                        self.ptt_owns_session = false;
+                    }
+
+                    ui.horizontal(|ui| {
+                        let hold_button = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Hold To Talk")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(121, 92, 44))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                        );
+
+                        let is_down = hold_button.is_pointer_button_down_on();
+                        let now = Instant::now();
+
+                        if is_down && !self.ptt_button_down {
+                            self.ptt_press_started_at = Some(now);
+                            self.ptt_pending_stop_after_start = false;
+                        }
+
+                        if is_down && !self.ptt_owns_session && !self.ptt_start_requested {
+                            let elapsed = self
+                                .ptt_press_started_at
+                                .map(|started| now.duration_since(started))
+                                .unwrap_or_default();
+                            let ready =
+                                elapsed >= Duration::from_millis(self.ptt_activation_delay_ms);
+                            if ready && !is_recording && snapshot.phase != "processing" {
+                                self.request_toggle_action();
+                                self.ptt_start_requested = true;
+                            }
+                        }
+
+                        if !is_down && self.ptt_button_down {
+                            if self.ptt_owns_session && is_recording {
+                                self.request_toggle_action();
+                            } else if self.ptt_start_requested {
+                                self.ptt_pending_stop_after_start = true;
+                            }
+
+                            self.ptt_owns_session = false;
+                            self.ptt_start_requested = false;
+                            self.ptt_press_started_at = None;
+                        }
+
+                        self.ptt_button_down = is_down;
+                        ui.label("Hold to talk (quick taps are ignored).");
+                    });
+                } else {
+                    self.reset_hold_state();
+                }
 
                 if self.show_meter {
                     let meter = egui::ProgressBar::new(snapshot.meter_level)
@@ -267,6 +366,7 @@ struct OverlayRuntimeConfig {
     engine_label: String,
     commit_label: String,
     hotkey_hint: String,
+    control_mode: InputControlMode,
     always_on_top: bool,
     width: f32,
     height: f32,
@@ -291,6 +391,7 @@ impl OverlayRuntimeConfig {
             engine_label,
             commit_label,
             hotkey_hint: "Super+R".to_string(),
+            control_mode: InputControlMode::Toggle,
             always_on_top: overlay_cfg.always_on_top,
             width: overlay_cfg.width as f32,
             height: overlay_cfg.height as f32,
@@ -308,6 +409,7 @@ impl OverlayRuntimeConfig {
             engine_label: "Streaming".to_string(),
             commit_label: "Copy to clipboard".to_string(),
             hotkey_hint: "Super+R".to_string(),
+            control_mode: InputControlMode::Toggle,
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
             height: cfg.height as f32,
@@ -319,9 +421,9 @@ impl OverlayRuntimeConfig {
 
 fn human_commit_label(commit_target: &str) -> String {
     match commit_target {
-        "text_io" => "Auto-paste".to_string(),
-        "clipboard" => "Copy to clipboard".to_string(),
-        "none" => "No output action".to_string(),
+        "text_io" => "Auto-paste final text into active app".to_string(),
+        "clipboard" => "Copy final text to clipboard".to_string(),
+        "none" => "No final output action".to_string(),
         other => other.to_string(),
     }
 }
@@ -672,6 +774,7 @@ fn run() -> Result<(), DynError> {
     let engine_label = runtime_cfg.engine_label.clone();
     let commit_label = runtime_cfg.commit_label.clone();
     let hotkey_hint = runtime_cfg.hotkey_hint.clone();
+    let control_mode = runtime_cfg.control_mode;
     eframe::run_native(
         "Audetic Overlay",
         native_options,
@@ -682,6 +785,7 @@ fn run() -> Result<(), DynError> {
                 engine_label.clone(),
                 commit_label.clone(),
                 hotkey_hint.clone(),
+                control_mode,
                 opacity,
                 show_meter,
             )))
