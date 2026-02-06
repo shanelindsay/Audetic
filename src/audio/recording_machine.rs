@@ -268,12 +268,22 @@ impl RecordingMachine {
             Transition::StopRecording => {
                 let job_id = current.current_job_id.clone();
                 // Job options should always be set when recording started, fall back to defaults if not
-                let job_options = current.current_job_options.unwrap_or(JobOptions {
+                let mut job_options = current.current_job_options.unwrap_or(JobOptions {
                     copy_to_clipboard: true,
                     auto_paste: self.behavior.auto_paste,
                     append_newline: Some(self.behavior.append_newline),
                     send_enter: Some(false),
                 });
+                if let Some(requested) = options {
+                    job_options.copy_to_clipboard = requested.copy_to_clipboard;
+                    job_options.auto_paste = requested.auto_paste;
+                    if requested.append_newline.is_some() {
+                        job_options.append_newline = requested.append_newline;
+                    }
+                    if requested.send_enter.is_some() {
+                        job_options.send_enter = requested.send_enter;
+                    }
+                }
                 info!(
                     "RecordingMachine: stopping recording and processing job_id={:?}, options={:?}",
                     job_id, job_options
