@@ -59,6 +59,10 @@ pub struct BehaviorConfig {
     pub audio_feedback: bool,
     #[serde(default)]
     pub append_newline: bool,
+    #[serde(default)]
+    pub audio_ducking: bool,
+    #[serde(default = "default_ducking_level_percent")]
+    pub ducking_level_percent: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +93,10 @@ pub struct OverlayConfig {
 
 fn default_audio_feedback() -> bool {
     true
+}
+
+fn default_ducking_level_percent() -> u8 {
+    35
 }
 
 impl Default for WhisperConfig {
@@ -141,6 +149,8 @@ impl Default for BehaviorConfig {
             delete_audio_files: true,
             audio_feedback: true,
             append_newline: false,
+            audio_ducking: false,
+            ducking_level_percent: default_ducking_level_percent(),
         }
     }
 }

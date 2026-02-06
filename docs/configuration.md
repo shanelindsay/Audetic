@@ -71,6 +71,8 @@ preserve_clipboard = false      # Keep clipboard content after pasting
 delete_audio_files = true       # Delete temporary audio files after processing
 audio_feedback = true           # Play audio feedback sounds
 append_newline = false          # Append newline to injected text (if auto_paste)
+audio_ducking = false           # Lower system output volume while recording
+ducking_level_percent = 35      # Target output volume percent while ducked
 
 [streaming]
 enabled = false
@@ -207,6 +209,8 @@ Controls how Audetic handles transcribed text and temporary files.
 | `delete_audio_files` | bool | `true` | Delete temporary audio recordings after processing |
 | `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
 | `append_newline` | bool | `false` | Append newline to injected text (if auto_paste) |
+| `audio_ducking` | bool | `false` | Enable temporary speaker-volume ducking while recording |
+| `ducking_level_percent` | integer | `35` | Target speaker volume (5-95) when ducking is active |
 
 ### [streaming] - Realtime Transcription
 

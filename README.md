@@ -57,12 +57,21 @@ Launch options:
 ```bash
 audetic-launch    # starts service if needed, then opens overlay
 audetic-overlay   # opens overlay only
+audetic-tray      # status tray icon (green/orange/red) with quick actions
 ```
 
 Install launcher icon for taskbar/app menu:
 
 ```bash
 ./scripts/install-desktop-launcher.sh
+```
+
+Optional audio ducking while recording:
+
+```toml
+[behavior]
+audio_ducking = true
+ducking_level_percent = 35
 ```
 
 ## Updates

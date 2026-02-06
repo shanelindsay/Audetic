@@ -2,8 +2,8 @@
 
 use crate::api::{ApiCommand, ApiServer};
 use crate::audio::{
-    AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle,
-    ToggleResult,
+    AudioDuckingController, AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase,
+    RecordingStatusHandle, ToggleResult,
 };
 use crate::config::Config;
 use crate::streaming::{StreamHub, StreamingMachine};
@@ -36,6 +36,10 @@ pub async fn run_service() -> Result<()> {
         delete_audio_files: config.behavior.delete_audio_files,
         append_newline: config.behavior.append_newline,
     };
+    let ducking = AudioDuckingController::new(
+        config.behavior.audio_ducking,
+        config.behavior.ducking_level_percent,
+    );
 
     let status_handle = RecordingStatusHandle::default();
     let recording_machine = if config.streaming.enabled {
@@ -104,28 +108,38 @@ pub async fn run_service() -> Result<()> {
                         phase: RecordingPhase::Recording,
                         job_id,
                     }) => {
+                        ducking.activate().await;
                         info!("Recording started with job_id={:?}", job_id);
                     }
                     Ok(ToggleResult {
                         phase: RecordingPhase::Processing,
                         job_id,
                     }) => {
+                        ducking.restore().await;
                         info!(
                             "Recording stopped, processing audio for job_id={:?}",
                             job_id
                         );
                     }
                     Ok(ToggleResult { phase, job_id }) => {
+                        if phase != RecordingPhase::Recording {
+                            ducking.restore().await;
+                        }
                         info!(
                             "RecordingMachine is currently {:?} (job_id={:?})",
                             phase, job_id
                         );
                     }
-                    Err(e) => error!("Failed to toggle recording: {}", e),
+                    Err(e) => {
+                        ducking.restore().await;
+                        error!("Failed to toggle recording: {}", e);
+                    }
                 }
             }
         }
     }
+
+    ducking.restore().await;
 
     Ok(())
 }
