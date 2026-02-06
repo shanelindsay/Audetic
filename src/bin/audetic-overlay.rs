@@ -40,10 +40,11 @@ impl Default for OverlayState {
 struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     toggle_url: String,
-    engine_label: String,
-    commit_label: String,
+    engine_mode: EngineMode,
     hotkey_hint: String,
     control_mode: InputControlMode,
+    copy_to_clipboard: bool,
+    auto_paste: bool,
     ptt_button_down: bool,
     ptt_owns_session: bool,
     ptt_start_requested: bool,
@@ -51,6 +52,18 @@ struct OverlayApp {
     ptt_press_started_at: Option<Instant>,
     ptt_activation_delay_ms: u64,
     last_toggle_request_at: Option<Instant>,
+    opacity: f32,
+    show_meter: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OverlayAppUiConfig {
+    toggle_url: String,
+    engine_mode: EngineMode,
+    hotkey_hint: String,
+    control_mode: InputControlMode,
+    copy_to_clipboard: bool,
+    auto_paste: bool,
     opacity: f32,
     show_meter: bool,
 }
@@ -70,24 +83,42 @@ impl InputControlMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineMode {
+    Streaming,
+    Batch,
+}
+
+impl EngineMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Streaming => "Streaming",
+            Self::Batch => "Batch",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Streaming => Self::Batch,
+            Self::Batch => Self::Streaming,
+        }
+    }
+
+    fn is_streaming(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+}
+
 impl OverlayApp {
-    fn new(
-        state: Arc<Mutex<OverlayState>>,
-        toggle_url: String,
-        engine_label: String,
-        commit_label: String,
-        hotkey_hint: String,
-        control_mode: InputControlMode,
-        opacity: f32,
-        show_meter: bool,
-    ) -> Self {
+    fn new(state: Arc<Mutex<OverlayState>>, ui_cfg: OverlayAppUiConfig) -> Self {
         Self {
             state,
-            toggle_url,
-            engine_label,
-            commit_label,
-            hotkey_hint,
-            control_mode,
+            toggle_url: ui_cfg.toggle_url,
+            engine_mode: ui_cfg.engine_mode,
+            hotkey_hint: ui_cfg.hotkey_hint,
+            control_mode: ui_cfg.control_mode,
+            copy_to_clipboard: ui_cfg.copy_to_clipboard,
+            auto_paste: ui_cfg.auto_paste,
             ptt_button_down: false,
             ptt_owns_session: false,
             ptt_start_requested: false,
@@ -95,8 +126,8 @@ impl OverlayApp {
             ptt_press_started_at: None,
             ptt_activation_delay_ms: 260,
             last_toggle_request_at: None,
-            opacity,
-            show_meter,
+            opacity: ui_cfg.opacity,
+            show_meter: ui_cfg.show_meter,
         }
     }
 
@@ -130,8 +161,50 @@ impl OverlayApp {
             let mut guard = self.state.lock().expect("overlay state lock poisoned");
             guard.status_line = "Toggling...".to_string();
         }
-        request_toggle(self.toggle_url.clone(), self.state.clone());
+        let body = ToggleBody {
+            copy_to_clipboard: Some(self.copy_to_clipboard),
+            auto_paste: Some(self.auto_paste),
+        };
+        request_toggle(self.toggle_url.clone(), self.state.clone(), Some(body));
     }
+
+    fn cycle_final_action_mode(&mut self) {
+        match (self.copy_to_clipboard, self.auto_paste) {
+            (true, true) => {
+                self.copy_to_clipboard = true;
+                self.auto_paste = false;
+            }
+            (true, false) => {
+                self.copy_to_clipboard = false;
+                self.auto_paste = true;
+            }
+            (false, true) => {
+                self.copy_to_clipboard = false;
+                self.auto_paste = false;
+            }
+            (false, false) => {
+                self.copy_to_clipboard = true;
+                self.auto_paste = true;
+            }
+        }
+
+        let mut guard = self.state.lock().expect("overlay state lock poisoned");
+        guard.status_line = format!(
+            "Final action set: {}",
+            format_run_output_mode(self.copy_to_clipboard, self.auto_paste)
+        );
+    }
+
+    fn cycle_engine_mode(&mut self) {
+        self.engine_mode = self.engine_mode.toggled();
+        persist_engine_mode(self.engine_mode, self.state.clone());
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ToggleBody {
+    copy_to_clipboard: Option<bool>,
+    auto_paste: Option<bool>,
 }
 
 impl eframe::App for OverlayApp {
@@ -164,58 +237,61 @@ impl eframe::App for OverlayApp {
                     ui.label(format!("{} | {}", snapshot.phase, snapshot.status_line));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.control_mode == InputControlMode::Toggle {
-                            let is_recording = snapshot.phase == "recording";
-                            let button_label = if is_recording { "Stop" } else { "Start" };
-                            let button_fill = if is_recording {
-                                egui::Color32::from_rgb(210, 70, 70)
-                            } else {
-                                egui::Color32::from_rgb(70, 180, 95)
-                            };
-                            let button_text = if is_recording {
-                                egui::RichText::new(button_label)
-                                    .strong()
-                                    .color(egui::Color32::WHITE)
-                            } else {
-                                egui::RichText::new(button_label)
-                                    .strong()
-                                    .color(egui::Color32::BLACK)
-                            };
-                            let clicked = ui
-                                .add(
-                                    egui::Button::new(button_text)
-                                        .fill(button_fill)
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
-                                )
-                                .clicked();
-                            if clicked {
-                                self.request_toggle_action();
-                            }
+                        let is_recording = snapshot.phase == "recording";
+                        let button_label = if is_recording { "Stop" } else { "Start" };
+                        let button_fill = if is_recording {
+                            egui::Color32::from_rgb(210, 70, 70)
                         } else {
-                            ui.small("Hold mode active");
+                            egui::Color32::from_rgb(70, 180, 95)
+                        };
+                        let button_text = if is_recording {
+                            egui::RichText::new(button_label)
+                                .strong()
+                                .color(egui::Color32::WHITE)
+                        } else {
+                            egui::RichText::new(button_label)
+                                .strong()
+                                .color(egui::Color32::BLACK)
+                        };
+                        let clicked = ui
+                            .add(
+                                egui::Button::new(button_text)
+                                    .fill(button_fill)
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                            )
+                            .clicked();
+                        if clicked {
+                            self.request_toggle_action();
                         }
                     });
                 });
 
                 ui.horizontal_wrapped(|ui| {
-                    draw_badge(
+                    if draw_clickable_badge(
                         ui,
-                        &format!("Engine: {}", self.engine_label),
+                        &format!("Engine: {}", self.engine_mode.label()),
                         egui::Color32::from_rgb(63, 81, 181),
                         egui::Color32::WHITE,
-                    );
+                    ) {
+                        self.cycle_engine_mode();
+                    }
                     draw_badge(
                         ui,
                         &format!("State: {}", snapshot.phase),
                         egui::Color32::from_rgb(84, 110, 122),
                         egui::Color32::WHITE,
                     );
-                    draw_badge(
+                    if draw_clickable_badge(
                         ui,
-                        &format!("Final action: {}", self.commit_label),
+                        &format!(
+                            "Final action: {}",
+                            format_run_output_mode(self.copy_to_clipboard, self.auto_paste)
+                        ),
                         egui::Color32::from_rgb(56, 142, 60),
                         egui::Color32::BLACK,
-                    );
+                    ) {
+                        self.cycle_final_action_mode();
+                    }
                     draw_badge(
                         ui,
                         &format!("Input: {}", self.control_mode.label()),
@@ -229,8 +305,8 @@ impl eframe::App for OverlayApp {
                         egui::Color32::WHITE,
                     );
                 });
-                ui.small("Engine changes require service restart.");
-                ui.small("Final action runs once when a final transcript is produced.");
+                ui.small("Click Engine to switch (service restart required).");
+                ui.small("Click Final action to cycle output mode for next run.");
 
                 ui.horizontal(|ui| {
                     ui.label("Control mode:");
@@ -363,10 +439,11 @@ impl eframe::App for OverlayApp {
 struct OverlayRuntimeConfig {
     url: String,
     toggle_url: String,
-    engine_label: String,
-    commit_label: String,
+    engine_mode: EngineMode,
     hotkey_hint: String,
     control_mode: InputControlMode,
+    copy_to_clipboard: bool,
+    auto_paste: bool,
     always_on_top: bool,
     width: f32,
     height: f32,
@@ -378,20 +455,20 @@ impl OverlayRuntimeConfig {
     fn from_config(config: &Config) -> Self {
         let overlay_cfg: &OverlayConfig = &config.overlay;
         let toggle_url = derive_toggle_url(&overlay_cfg.url);
-        let engine_label = if config.streaming.enabled {
-            "Streaming".to_string()
+        let engine_mode = if config.streaming.enabled {
+            EngineMode::Streaming
         } else {
-            "Batch".to_string()
+            EngineMode::Batch
         };
-        let commit_label = human_commit_label(&config.streaming.commit_target);
 
         Self {
             url: overlay_cfg.url.clone(),
             toggle_url,
-            engine_label,
-            commit_label,
+            engine_mode,
             hotkey_hint: "Super+R".to_string(),
             control_mode: InputControlMode::Toggle,
+            copy_to_clipboard: true,
+            auto_paste: config.behavior.auto_paste,
             always_on_top: overlay_cfg.always_on_top,
             width: overlay_cfg.width as f32,
             height: overlay_cfg.height as f32,
@@ -406,10 +483,11 @@ impl OverlayRuntimeConfig {
         Self {
             url: cfg.url,
             toggle_url,
-            engine_label: "Streaming".to_string(),
-            commit_label: "Copy to clipboard".to_string(),
+            engine_mode: EngineMode::Streaming,
             hotkey_hint: "Super+R".to_string(),
             control_mode: InputControlMode::Toggle,
+            copy_to_clipboard: true,
+            auto_paste: true,
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
             height: cfg.height as f32,
@@ -419,12 +497,12 @@ impl OverlayRuntimeConfig {
     }
 }
 
-fn human_commit_label(commit_target: &str) -> String {
-    match commit_target {
-        "text_io" => "Auto-paste final text into active app".to_string(),
-        "clipboard" => "Copy final text to clipboard".to_string(),
-        "none" => "No final output action".to_string(),
-        other => other.to_string(),
+fn format_run_output_mode(copy_to_clipboard: bool, auto_paste: bool) -> &'static str {
+    match (copy_to_clipboard, auto_paste) {
+        (true, true) => "Copy + paste",
+        (true, false) => "Copy only",
+        (false, true) => "Paste only",
+        (false, false) => "No output",
     }
 }
 
@@ -435,6 +513,36 @@ fn load_runtime_config() -> OverlayRuntimeConfig {
     }
 }
 
+fn persist_engine_mode(mode: EngineMode, state: Arc<Mutex<OverlayState>>) {
+    thread::spawn(move || {
+        let save_result = (|| -> Result<(), String> {
+            let mut config =
+                Config::load().map_err(|err| format!("Failed to load config: {err}"))?;
+            config.streaming.enabled = mode.is_streaming();
+            config
+                .save()
+                .map_err(|err| format!("Failed to save config: {err}"))?;
+            Ok(())
+        })();
+
+        let mut guard = state.lock().expect("overlay state lock poisoned");
+        match save_result {
+            Ok(()) => {
+                guard.last_error = None;
+                guard.status_line = format!(
+                    "Engine set to {}. Restart Audetic service to apply.",
+                    mode.label()
+                );
+            }
+            Err(err) => {
+                guard.phase = "error".to_string();
+                guard.last_error = Some(err.clone());
+                guard.status_line = err;
+            }
+        }
+    });
+}
+
 fn draw_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_color: egui::Color32) {
     egui::Frame::none()
         .fill(fill)
@@ -443,6 +551,22 @@ fn draw_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_color: eg
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).color(text_color).strong());
         });
+}
+
+fn draw_clickable_badge(
+    ui: &mut egui::Ui,
+    text: &str,
+    fill: egui::Color32,
+    text_color: egui::Color32,
+) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(text_color).strong())
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_black_alpha(90)))
+            .rounding(egui::Rounding::same(8.0))
+            .min_size(egui::vec2(0.0, 22.0)),
+    )
+    .clicked()
 }
 
 fn dbfs_to_level(dbfs: f32) -> f32 {
@@ -577,7 +701,7 @@ fn derive_toggle_url(stream_events_url: &str) -> String {
     }
 }
 
-fn request_toggle(toggle_url: String, state: Arc<Mutex<OverlayState>>) {
+fn request_toggle(toggle_url: String, state: Arc<Mutex<OverlayState>>, body: Option<ToggleBody>) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(2))
@@ -594,7 +718,12 @@ fn request_toggle(toggle_url: String, state: Arc<Mutex<OverlayState>>) {
             }
         };
 
-        let response = client.post(&toggle_url).send();
+        let request = client.post(&toggle_url);
+        let response = if let Some(payload) = body {
+            request.json(&payload).send()
+        } else {
+            request.send()
+        };
         let response = match response {
             Ok(resp) => resp,
             Err(err) => {
@@ -771,24 +900,26 @@ fn run() -> Result<(), DynError> {
     let opacity = runtime_cfg.opacity;
     let show_meter = runtime_cfg.show_meter;
     let toggle_url = runtime_cfg.toggle_url.clone();
-    let engine_label = runtime_cfg.engine_label.clone();
-    let commit_label = runtime_cfg.commit_label.clone();
+    let engine_mode = runtime_cfg.engine_mode;
     let hotkey_hint = runtime_cfg.hotkey_hint.clone();
     let control_mode = runtime_cfg.control_mode;
+    let copy_to_clipboard = runtime_cfg.copy_to_clipboard;
+    let auto_paste = runtime_cfg.auto_paste;
     eframe::run_native(
         "Audetic Overlay",
         native_options,
         Box::new(move |_cc| {
-            Ok(Box::new(OverlayApp::new(
-                state.clone(),
-                toggle_url.clone(),
-                engine_label.clone(),
-                commit_label.clone(),
-                hotkey_hint.clone(),
+            let ui_cfg = OverlayAppUiConfig {
+                toggle_url: toggle_url.clone(),
+                engine_mode,
+                hotkey_hint: hotkey_hint.clone(),
                 control_mode,
+                copy_to_clipboard,
+                auto_paste,
                 opacity,
                 show_meter,
-            )))
+            };
+            Ok(Box::new(OverlayApp::new(state.clone(), ui_cfg)))
         }),
     )
     .map_err(|err| -> DynError { Box::new(err) })?;
