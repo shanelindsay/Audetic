@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audetic::config::{Config, OverlayConfig};
 use audetic::streaming::events::StreamEvent;
@@ -40,11 +40,13 @@ impl Default for OverlayState {
 struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     toggle_url: String,
-    mode_label: String,
+    engine_label: String,
     commit_label: String,
     hotkey_hint: String,
     ptt_button_down: bool,
     ptt_owns_session: bool,
+    ptt_press_started_at: Option<Instant>,
+    ptt_activation_delay_ms: u64,
     opacity: f32,
     show_meter: bool,
 }
@@ -53,7 +55,7 @@ impl OverlayApp {
     fn new(
         state: Arc<Mutex<OverlayState>>,
         toggle_url: String,
-        mode_label: String,
+        engine_label: String,
         commit_label: String,
         hotkey_hint: String,
         opacity: f32,
@@ -62,11 +64,13 @@ impl OverlayApp {
         Self {
             state,
             toggle_url,
-            mode_label,
+            engine_label,
             commit_label,
             hotkey_hint,
             ptt_button_down: false,
             ptt_owns_session: false,
+            ptt_press_started_at: None,
+            ptt_activation_delay_ms: 180,
             opacity,
             show_meter,
         }
@@ -140,13 +144,19 @@ impl eframe::App for OverlayApp {
                 ui.horizontal_wrapped(|ui| {
                     draw_badge(
                         ui,
-                        &format!("Mode: {}", self.mode_label),
+                        &format!("Engine: {}", self.engine_label),
                         egui::Color32::from_rgb(63, 81, 181),
                         egui::Color32::WHITE,
                     );
                     draw_badge(
                         ui,
-                        &format!("Commit: {}", self.commit_label),
+                        &format!("State: {}", snapshot.phase),
+                        egui::Color32::from_rgb(84, 110, 122),
+                        egui::Color32::WHITE,
+                    );
+                    draw_badge(
+                        ui,
+                        &format!("Final action: {}", self.commit_label),
                         egui::Color32::from_rgb(56, 142, 60),
                         egui::Color32::BLACK,
                     );
@@ -157,31 +167,49 @@ impl eframe::App for OverlayApp {
                         egui::Color32::WHITE,
                     );
                 });
+                ui.small("Engine changes require service restart.");
+                ui.small("Final action applies to final transcript only (not partial text).");
 
                 ui.horizontal(|ui| {
                     let hold_button = ui.add(
-                        egui::Button::new(egui::RichText::new("Hold To Talk").strong())
-                            .fill(egui::Color32::from_rgb(245, 203, 66))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                        egui::Button::new(
+                            egui::RichText::new("Hold To Talk")
+                                .strong()
+                                .color(egui::Color32::BLACK),
+                        )
+                        .fill(egui::Color32::from_rgb(186, 149, 68))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
                     );
 
                     let is_down = hold_button.is_pointer_button_down_on();
-                    let is_recording = snapshot.phase == "recording";
+                    let now = Instant::now();
 
-                    if is_down && !self.ptt_button_down && !is_recording {
-                        request_toggle(self.toggle_url.clone(), self.state.clone());
-                        self.ptt_owns_session = true;
+                    if is_down && !self.ptt_button_down {
+                        self.ptt_press_started_at = Some(now);
+                    }
+
+                    if is_down && !self.ptt_owns_session {
+                        let elapsed = self
+                            .ptt_press_started_at
+                            .map(|started| now.duration_since(started))
+                            .unwrap_or_default();
+                        let ready = elapsed >= Duration::from_millis(self.ptt_activation_delay_ms);
+                        if ready && snapshot.phase != "recording" {
+                            request_toggle(self.toggle_url.clone(), self.state.clone());
+                            self.ptt_owns_session = true;
+                        }
                     }
 
                     if !is_down && self.ptt_button_down {
-                        if self.ptt_owns_session && is_recording {
+                        if self.ptt_owns_session {
                             request_toggle(self.toggle_url.clone(), self.state.clone());
                         }
                         self.ptt_owns_session = false;
+                        self.ptt_press_started_at = None;
                     }
 
                     self.ptt_button_down = is_down;
-                    ui.label("Press and hold for push-to-talk.");
+                    ui.label("Hold to talk (quick taps are ignored).");
                 });
 
                 if self.show_meter {
@@ -236,7 +264,7 @@ impl eframe::App for OverlayApp {
 struct OverlayRuntimeConfig {
     url: String,
     toggle_url: String,
-    mode_label: String,
+    engine_label: String,
     commit_label: String,
     hotkey_hint: String,
     always_on_top: bool,
@@ -250,22 +278,17 @@ impl OverlayRuntimeConfig {
     fn from_config(config: &Config) -> Self {
         let overlay_cfg: &OverlayConfig = &config.overlay;
         let toggle_url = derive_toggle_url(&overlay_cfg.url);
-        let mode_label = if config.streaming.enabled {
+        let engine_label = if config.streaming.enabled {
             "Streaming".to_string()
         } else {
             "Batch".to_string()
         };
-        let commit_label = match config.streaming.commit_target.as_str() {
-            "text_io" => "Auto-paste".to_string(),
-            "clipboard" => "Clipboard".to_string(),
-            "none" => "None".to_string(),
-            other => other.to_string(),
-        };
+        let commit_label = human_commit_label(&config.streaming.commit_target);
 
         Self {
             url: overlay_cfg.url.clone(),
             toggle_url,
-            mode_label,
+            engine_label,
             commit_label,
             hotkey_hint: "Super+R".to_string(),
             always_on_top: overlay_cfg.always_on_top,
@@ -282,8 +305,8 @@ impl OverlayRuntimeConfig {
         Self {
             url: cfg.url,
             toggle_url,
-            mode_label: "Streaming".to_string(),
-            commit_label: "Clipboard".to_string(),
+            engine_label: "Streaming".to_string(),
+            commit_label: "Copy to clipboard".to_string(),
             hotkey_hint: "Super+R".to_string(),
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
@@ -291,6 +314,15 @@ impl OverlayRuntimeConfig {
             opacity: cfg.opacity,
             show_meter: cfg.show_meter,
         }
+    }
+}
+
+fn human_commit_label(commit_target: &str) -> String {
+    match commit_target {
+        "text_io" => "Auto-paste".to_string(),
+        "clipboard" => "Copy to clipboard".to_string(),
+        "none" => "No output action".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -637,7 +669,7 @@ fn run() -> Result<(), DynError> {
     let opacity = runtime_cfg.opacity;
     let show_meter = runtime_cfg.show_meter;
     let toggle_url = runtime_cfg.toggle_url.clone();
-    let mode_label = runtime_cfg.mode_label.clone();
+    let engine_label = runtime_cfg.engine_label.clone();
     let commit_label = runtime_cfg.commit_label.clone();
     let hotkey_hint = runtime_cfg.hotkey_hint.clone();
     eframe::run_native(
@@ -647,7 +679,7 @@ fn run() -> Result<(), DynError> {
             Ok(Box::new(OverlayApp::new(
                 state.clone(),
                 toggle_url.clone(),
-                mode_label.clone(),
+                engine_label.clone(),
                 commit_label.clone(),
                 hotkey_hint.clone(),
                 opacity,
