@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -21,8 +22,26 @@ fn service_is_running() -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_sibling_binary(name: &str) -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let sibling = current.with_file_name(name);
+    if sibling.exists() {
+        Some(sibling)
+    } else {
+        None
+    }
+}
+
+fn audetic_service_command() -> PathBuf {
+    resolve_sibling_binary("audetic").unwrap_or_else(|| PathBuf::from("audetic"))
+}
+
+fn audetic_overlay_command() -> PathBuf {
+    resolve_sibling_binary("audetic-overlay").unwrap_or_else(|| PathBuf::from("audetic-overlay"))
+}
+
 fn start_service_detached() -> Result<()> {
-    Command::new("audetic")
+    Command::new(audetic_service_command())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -38,7 +57,7 @@ fn main() -> Result<()> {
         thread::sleep(Duration::from_millis(600));
     }
 
-    let status = Command::new("audetic-overlay")
+    let status = Command::new(audetic_overlay_command())
         .status()
         .context("Failed to launch audetic-overlay")?;
 
