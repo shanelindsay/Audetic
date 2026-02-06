@@ -11,6 +11,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
+    pub streaming: StreamingConfig,
+    pub overlay: OverlayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,32 @@ pub struct BehaviorConfig {
     pub audio_feedback: bool,
     #[serde(default)]
     pub append_newline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub api_base_url: String,
+    pub sample_rate_hz: u32,
+    pub chunk_ms: u32,
+    pub silence_timeout_ms: u64,
+    pub commit_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub always_on_top: bool,
+    pub width: u32,
+    pub height: u32,
+    pub opacity: f32,
+    pub show_meter: bool,
 }
 
 fn default_audio_feedback() -> bool {
@@ -113,6 +141,36 @@ impl Default for BehaviorConfig {
             delete_audio_files: true,
             audio_feedback: true,
             append_newline: false,
+        }
+    }
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "mistral_realtime".to_string(),
+            api_key: None,
+            model: "voxtral-mini-transcribe-realtime-2602".to_string(),
+            api_base_url: "https://api.mistral.ai".to_string(),
+            sample_rate_hz: 16_000,
+            chunk_ms: 20,
+            silence_timeout_ms: 700,
+            commit_target: "clipboard".to_string(),
+        }
+    }
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: "http://127.0.0.1:3737/stream/events".to_string(),
+            always_on_top: true,
+            width: 560,
+            height: 220,
+            opacity: 0.94,
+            show_meter: true,
         }
     }
 }

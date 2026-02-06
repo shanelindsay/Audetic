@@ -238,23 +238,21 @@ impl TextIoService {
         }
 
         if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-            if desktop == "KDE" {
-                if which("ydotool").is_ok() {
-                    debug!("Trying ydotool paste (Shift+Insert)");
-                    if let Ok(output) = Command::new("ydotool")
-                        .args(["key", "42:1", "110:1", "110:0", "42:0"])
-                        .output()
-                    {
-                        if output.status.success() {
-                            debug!("Successfully pasted with ydotool (Shift+Insert)");
-                            return Ok(());
-                        }
-                        debug!(
-                            "ydotool Shift+Insert failed: status={:?} stderr={}",
-                            output.status.code(),
-                            String::from_utf8_lossy(&output.stderr)
-                        );
+            if desktop == "KDE" && which("ydotool").is_ok() {
+                debug!("Trying ydotool paste (Shift+Insert)");
+                if let Ok(output) = Command::new("ydotool")
+                    .args(["key", "42:1", "110:1", "110:0", "42:0"])
+                    .output()
+                {
+                    if output.status.success() {
+                        debug!("Successfully pasted with ydotool (Shift+Insert)");
+                        return Ok(());
                     }
+                    debug!(
+                        "ydotool Shift+Insert failed: status={:?} stderr={}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
             }
         }
@@ -279,7 +277,9 @@ impl TextIoService {
 
         if which("wtype").is_ok() {
             if let Ok(output) = Command::new("wtype")
-                .args(["-M", "ctrl", "-M", "shift", "-P", "v", "-m", "shift", "-m", "ctrl"])
+                .args([
+                    "-M", "ctrl", "-M", "shift", "-P", "v", "-m", "shift", "-m", "ctrl",
+                ])
                 .output()
             {
                 if output.status.success() {

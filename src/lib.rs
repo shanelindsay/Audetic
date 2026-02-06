@@ -9,6 +9,7 @@ pub mod history;
 pub mod keybind;
 pub mod logs;
 pub mod normalizer;
+pub mod streaming;
 pub mod text_io;
 pub mod transcription;
 pub mod ui;

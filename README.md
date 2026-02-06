@@ -35,6 +35,36 @@ audetic provider configure   # interactive wizard (requires a TTY)
 audetic provider test        # validate the stored provider
 ```
 
+### Streaming Overlay (Optional)
+
+Audetic includes an optional low-latency streaming mode with a native overlay UI (live partial text + meter).
+
+```toml
+[streaming]
+enabled = true
+provider = "mistral_realtime"
+commit_target = "clipboard"
+
+[overlay]
+enabled = true
+url = "http://127.0.0.1:3737/stream/events"
+```
+
+Set your API key with `MISTRAL_API_KEY` (or `[streaming].api_key`).
+
+Launch options:
+
+```bash
+audetic-launch    # starts service if needed, then opens overlay
+audetic-overlay   # opens overlay only
+```
+
+Install launcher icon for taskbar/app menu:
+
+```bash
+./scripts/install-desktop-launcher.sh
+```
+
 ## Updates
 
 Audetic includes an auto-updater plus manual controls:

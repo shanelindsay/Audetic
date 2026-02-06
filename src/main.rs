@@ -47,5 +47,6 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    app::run_service().await
+    let local = tokio::task::LocalSet::new();
+    local.run_until(app::run_service()).await
 }

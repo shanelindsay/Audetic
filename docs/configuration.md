@@ -71,6 +71,26 @@ preserve_clipboard = false      # Keep clipboard content after pasting
 delete_audio_files = true       # Delete temporary audio files after processing
 audio_feedback = true           # Play audio feedback sounds
 append_newline = false          # Append newline to injected text (if auto_paste)
+
+[streaming]
+enabled = false
+provider = "mistral_realtime"
+api_key = ""                    # Optional; use MISTRAL_API_KEY env var instead
+model = "voxtral-mini-transcribe-realtime-2602"
+api_base_url = "https://api.mistral.ai"
+sample_rate_hz = 16000
+chunk_ms = 20
+silence_timeout_ms = 700
+commit_target = "clipboard"     # clipboard | text_io | none
+
+[overlay]
+enabled = true
+url = "http://127.0.0.1:3737/stream/events"
+always_on_top = true
+width = 560
+height = 220
+opacity = 0.94
+show_meter = true
 ```
 
 ## Configuration Sections
@@ -188,6 +208,36 @@ Controls how Audetic handles transcribed text and temporary files.
 | `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
 | `append_newline` | bool | `false` | Append newline to injected text (if auto_paste) |
 
+### [streaming] - Realtime Transcription
+
+Controls the optional low-latency streaming mode.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enables streaming pipeline instead of batch record-then-transcribe |
+| `provider` | string | `"mistral_realtime"` | Streaming provider name (currently Mistral realtime) |
+| `api_key` | string | empty | API key override (falls back to `MISTRAL_API_KEY`) |
+| `model` | string | `"voxtral-mini-transcribe-realtime-2602"` | Mistral realtime model |
+| `api_base_url` | string | `"https://api.mistral.ai"` | Base API URL |
+| `sample_rate_hz` | integer | `16000` | Audio sample rate |
+| `chunk_ms` | integer | `20` | Audio chunk size in milliseconds |
+| `silence_timeout_ms` | integer | `700` | End-of-utterance silence timeout |
+| `commit_target` | string | `"clipboard"` | Final text destination: `clipboard`, `text_io`, or `none` |
+
+### [overlay] - Live Transcript Overlay
+
+Configures the optional native overlay window for partial text and level meter.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `true` | Enables overlay settings for `audetic-overlay` |
+| `url` | string | `"http://127.0.0.1:3737/stream/events"` | SSE endpoint for live stream events |
+| `always_on_top` | bool | `true` | Keep overlay above other windows |
+| `width` | integer | `560` | Initial overlay width in pixels |
+| `height` | integer | `220` | Initial overlay height in pixels |
+| `opacity` | float | `0.94` | Background opacity (0.0-1.0) |
+| `show_meter` | bool | `true` | Show live mic level meter |
+
 ## Configuration File Location
 
 Audetic looks for its configuration file at:
@@ -203,6 +253,7 @@ Audetic respects these environment variables:
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`) |
+| `MISTRAL_API_KEY` | API key for realtime streaming mode (used when `[streaming].api_key` is empty) |
 
 ## Common Configuration Scenarios
 

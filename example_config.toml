@@ -37,3 +37,23 @@ preserve_clipboard = false
 delete_audio_files = true
 audio_feedback = true
 append_newline = false         # Append newline to injected text (if auto_paste)
+
+[streaming]
+enabled = false
+provider = "mistral_realtime"  # Current streaming provider
+# api_key = "your-mistral-api-key"  # Optional; falls back to MISTRAL_API_KEY env var
+model = "voxtral-mini-transcribe-realtime-2602"
+api_base_url = "https://api.mistral.ai"
+sample_rate_hz = 16000
+chunk_ms = 20
+silence_timeout_ms = 700
+commit_target = "clipboard"    # clipboard | text_io | none
+
+[overlay]
+enabled = true
+url = "http://127.0.0.1:3737/stream/events"
+always_on_top = true
+width = 560
+height = 220
+opacity = 0.94
+show_meter = true

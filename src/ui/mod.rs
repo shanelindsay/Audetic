@@ -71,7 +71,7 @@ impl Indicator {
             text.to_string()
         };
 
-        self.notify_with_icon(&format!("{preview}"), "dialog-information", None);
+        self.notify_with_icon(&preview, "dialog-information", None);
 
         // Play completion sound
         self.play_sound("complete").await;

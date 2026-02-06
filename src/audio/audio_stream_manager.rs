@@ -160,6 +160,41 @@ impl AudioStreamManager {
         Ok(output_path)
     }
 
+    /// Drain currently buffered samples without stopping the active stream.
+    pub fn drain_samples(&self) -> Vec<f32> {
+        let mut samples = self.samples.lock().unwrap();
+        std::mem::take(&mut *samples)
+    }
+
+    /// Stop recording and discard captured audio (used for streaming mode).
+    pub async fn stop_recording_discard(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+
+        match *state {
+            RecordingState::Idle => {
+                return Ok(());
+            }
+            RecordingState::Stopping => {
+                return Ok(());
+            }
+            RecordingState::Recording => {}
+        }
+
+        *state = RecordingState::Stopping;
+        drop(state);
+
+        self.cleanup_stream();
+
+        {
+            let mut samples = self.samples.lock().unwrap();
+            samples.clear();
+            samples.shrink_to_fit();
+        }
+
+        *self.state.lock().unwrap() = RecordingState::Idle;
+        Ok(())
+    }
+
     /// Cleanup any active stream
     fn cleanup_stream(&self) {
         let mut active_stream = self.active_stream.lock().unwrap();

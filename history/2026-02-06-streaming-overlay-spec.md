@@ -133,7 +133,30 @@ show_meter = true
 4. Phase D: add desktop launcher/icon install logic.
 5. Phase E: docs + quick manual QA.
 
-## 8. Manual QA Checklist (Short)
+## 8. Phase Test Gates
+
+1. Phase A (events + meter + SSE):
+   - Unit test: RMS/peak/clipping calculations.
+   - Unit test: SSE event JSON envelope shape.
+   - Manual smoke: `curl -N http://127.0.0.1:3737/stream/events` shows live events.
+2. Phase B (Mistral streaming):
+   - Integration test with mocked provider for partial/final ordering.
+   - Integration test for provider disconnect path (clean error, no crash).
+   - Manual smoke: first partial appears during speech.
+3. Phase C (overlay UI):
+   - Manual test: overlay launches and subscribes to SSE.
+   - Manual test: meter updates in real time.
+   - Manual test: overlay reconnects after service restart.
+4. Phase D (taskbar launcher/icon):
+   - Manual test: `.desktop` file installed in user applications path.
+   - Manual test: icon resolves in app launcher/taskbar.
+   - Manual test: click launcher starts `audetic`.
+5. Phase E (docs + final QA):
+   - Manual test: full flow repeated 5 times (start, speak, final, stop).
+   - Manual test: clipboard output correct for each final segment.
+   - Verify docs match actual config keys and launcher steps.
+
+## 9. Manual QA Checklist (Short)
 
 1. Start audetic, toggle recording, partial text appears quickly.
 2. Meter moves with voice and clips on loud input.
@@ -141,7 +164,7 @@ show_meter = true
 4. Stop/start works repeatedly.
 5. Clicking Audetic launcher starts app.
 
-## 9. Estimate
+## 10. Estimate
 
 1. Core streaming + overlay: 3-5 days.
 2. Launcher/icon + polish: 0.5-1 day.

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Audetic
+GenericName=Voice Transcription
+Comment=Live speech-to-text overlay
+Exec=audetic-launch
+Icon=audetic
+Terminal=false
+Categories=Utility;AudioVideo;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

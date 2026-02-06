@@ -6,6 +6,7 @@ use crate::audio::{
     ToggleResult,
 };
 use crate::config::Config;
+use crate::streaming::{StreamHub, StreamingMachine};
 use crate::text_io::TextIoService;
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
@@ -22,9 +23,7 @@ pub async fn run_service() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
     let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::new()?));
-
-    let whisper = build_transcriber(&config)?;
-    let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
+    let stream_hub = Arc::new(StreamHub::new());
 
     let text_io = TextIoService::new(
         Some(&config.wayland.input_method),
@@ -32,22 +31,48 @@ pub async fn run_service() -> Result<()> {
     )?;
     let indicator =
         Indicator::from_config(&config.ui).with_audio_feedback(config.behavior.audio_feedback);
+    let behavior = BehaviorOptions {
+        auto_paste: config.behavior.auto_paste,
+        delete_audio_files: config.behavior.delete_audio_files,
+        append_newline: config.behavior.append_newline,
+    };
 
     let status_handle = RecordingStatusHandle::default();
-    let recording_machine = RecordingMachine::new(
-        audio_recorder.clone(),
-        transcription_service,
-        indicator,
-        text_io,
-        BehaviorOptions {
-            auto_paste: config.behavior.auto_paste,
-            delete_audio_files: config.behavior.delete_audio_files,
-            append_newline: config.behavior.append_newline,
-        },
-        status_handle.clone(),
-    );
+    let recording_machine = if config.streaming.enabled {
+        None
+    } else {
+        let whisper = build_transcriber(&config)?;
+        let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
+        Some(RecordingMachine::new(
+            audio_recorder.clone(),
+            transcription_service,
+            indicator.clone(),
+            text_io.clone(),
+            behavior,
+            status_handle.clone(),
+        ))
+    };
 
-    let api_server = ApiServer::new(tx, status_handle.clone(), &config);
+    let streaming_machine = if config.streaming.enabled {
+        info!(
+            "Streaming mode enabled with provider={} model={}",
+            config.streaming.provider, config.streaming.model
+        );
+
+        Some(StreamingMachine::new(
+            audio_recorder.clone(),
+            indicator.clone(),
+            text_io.clone(),
+            behavior,
+            status_handle.clone(),
+            stream_hub.clone(),
+            config.streaming.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let api_server = ApiServer::new(tx, status_handle.clone(), &config, Some(stream_hub.clone()));
     tokio::spawn(async move {
         if let Err(e) = api_server.start().await {
             error!("API server failed: {}", e);
@@ -64,7 +89,17 @@ pub async fn run_service() -> Result<()> {
     while let Some(command) = rx.recv().await {
         match command {
             ApiCommand::ToggleRecording(job_options) => {
-                match recording_machine.toggle(job_options).await {
+                let toggle_result = if let Some(machine) = streaming_machine.as_ref() {
+                    machine.toggle(job_options).await
+                } else {
+                    recording_machine
+                        .as_ref()
+                        .expect("recording machine should exist when streaming is disabled")
+                        .toggle(job_options)
+                        .await
+                };
+
+                match toggle_result {
                     Ok(ToggleResult {
                         phase: RecordingPhase::Recording,
                         job_id,

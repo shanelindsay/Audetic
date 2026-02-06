@@ -12,9 +12,11 @@ pub mod error;
 pub mod routes;
 
 use crate::config::Config;
+use crate::streaming::StreamHub;
 use anyhow::Result;
 use axum::{response::Json, routing::get, Router};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tracing::info;
 
@@ -23,6 +25,7 @@ pub use routes::recording::{ApiCommand, RecordingState, ToggleRequest};
 pub struct ApiServer {
     port: u16,
     recording_state: RecordingState,
+    stream_hub: Option<Arc<StreamHub>>,
 }
 
 impl ApiServer {
@@ -30,6 +33,7 @@ impl ApiServer {
         tx: tokio::sync::mpsc::Sender<ApiCommand>,
         status: crate::audio::RecordingStatusHandle,
         config: &Config,
+        stream_hub: Option<Arc<StreamHub>>,
     ) -> Self {
         Self {
             port: 3737, // WHSP in numbers
@@ -38,11 +42,12 @@ impl ApiServer {
                 status,
                 waybar_config: config.ui.waybar.clone(),
             },
+            stream_hub,
         }
     }
 
     pub async fn start(self) -> Result<()> {
-        let app = Router::new()
+        let mut app = Router::new()
             // Root and version endpoints
             .route("/", get(status))
             .route("/version", get(version))
@@ -55,6 +60,13 @@ impl ApiServer {
             .nest("/provider", routes::provider::router())
             .nest("/update", routes::update::router())
             .layer(ServiceBuilder::new());
+
+        if let Some(hub) = self.stream_hub {
+            app = app.nest(
+                "/stream",
+                routes::stream::router(routes::stream::StreamState { hub }),
+            );
+        }
 
         let listener = tokio::net::TcpListener::bind(&format!("127.0.0.1:{}", self.port)).await?;
 
@@ -75,6 +87,8 @@ impl ApiServer {
         info!("  GET  /update/check  - Check for updates");
         info!("  POST /update/install - Install update");
         info!("  PUT  /update/auto   - Toggle auto-update");
+        info!("  GET  /stream/events - Live SSE stream events");
+        info!("  GET  /stream/status - Streaming status snapshot");
 
         axum::serve(listener, app).await?;
 
