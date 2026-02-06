@@ -39,14 +39,21 @@ impl Default for OverlayState {
 
 struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
+    toggle_url: String,
     opacity: f32,
     show_meter: bool,
 }
 
 impl OverlayApp {
-    fn new(state: Arc<Mutex<OverlayState>>, opacity: f32, show_meter: bool) -> Self {
+    fn new(
+        state: Arc<Mutex<OverlayState>>,
+        toggle_url: String,
+        opacity: f32,
+        show_meter: bool,
+    ) -> Self {
         Self {
             state,
+            toggle_url,
             opacity,
             show_meter,
         }
@@ -81,6 +88,31 @@ impl eframe::App for OverlayApp {
                     };
                     ui.colored_label(status_color, "●");
                     ui.label(format!("{} | {}", snapshot.phase, snapshot.status_line));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let is_recording = snapshot.phase == "recording";
+                        let button_label = if is_recording { "Stop" } else { "Start" };
+                        let button_fill = if is_recording {
+                            egui::Color32::from_rgb(210, 70, 70)
+                        } else {
+                            egui::Color32::from_rgb(70, 180, 95)
+                        };
+                        let clicked = ui
+                            .add(
+                                egui::Button::new(button_label)
+                                    .fill(button_fill)
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                            )
+                            .clicked();
+                        if clicked {
+                            {
+                                let mut guard =
+                                    self.state.lock().expect("overlay state lock poisoned");
+                                guard.status_line = "Toggling...".to_string();
+                            }
+                            request_toggle(self.toggle_url.clone(), self.state.clone());
+                        }
+                    });
                 });
 
                 if self.show_meter {
@@ -134,6 +166,7 @@ impl eframe::App for OverlayApp {
 #[derive(Debug, Clone)]
 struct OverlayRuntimeConfig {
     url: String,
+    toggle_url: String,
     always_on_top: bool,
     width: f32,
     height: f32,
@@ -143,8 +176,10 @@ struct OverlayRuntimeConfig {
 
 impl OverlayRuntimeConfig {
     fn from_overlay_config(cfg: &OverlayConfig) -> Self {
+        let toggle_url = derive_toggle_url(&cfg.url);
         Self {
             url: cfg.url.clone(),
+            toggle_url,
             always_on_top: cfg.always_on_top,
             width: cfg.width as f32,
             height: cfg.height as f32,
@@ -162,9 +197,9 @@ fn load_runtime_config() -> OverlayRuntimeConfig {
 }
 
 fn dbfs_to_level(dbfs: f32) -> f32 {
-    let floor = -60.0;
+    let floor = -72.0;
     let normalized = (dbfs - floor) / (0.0 - floor);
-    normalized.clamp(0.0, 1.0)
+    normalized.clamp(0.0, 1.0).powf(0.55)
 }
 
 fn push_final_line(state: &mut OverlayState, line: String) {
@@ -219,13 +254,24 @@ fn apply_stream_event(state: &Arc<Mutex<OverlayState>>, stream_event: StreamEven
                 .get("rms_dbfs")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(-90.0) as f32;
+            let peak = stream_event
+                .data
+                .get("peak_dbfs")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(rms as f64) as f32;
             let clipping = stream_event
                 .data
                 .get("clipping")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            guard.meter_level = dbfs_to_level(rms);
+            // Blend RMS and peak for a more responsive but stable UI meter.
+            let target = dbfs_to_level(rms).max(dbfs_to_level(peak) * 0.8);
+            if target >= guard.meter_level {
+                guard.meter_level = guard.meter_level * 0.3 + target * 0.7;
+            } else {
+                guard.meter_level = guard.meter_level * 0.82 + target * 0.18;
+            }
             guard.clipping = clipping;
         }
         "error" => {
@@ -269,6 +315,73 @@ fn handle_dispatch(state: &Arc<Mutex<OverlayState>>, event_name: &str, payload: 
         Ok(event) => apply_stream_event(state, event),
         Err(_) => apply_fallback_event(state, event_name, payload),
     }
+}
+
+fn derive_toggle_url(stream_events_url: &str) -> String {
+    match reqwest::Url::parse(stream_events_url) {
+        Ok(mut url) => {
+            url.set_path("/toggle");
+            url.set_query(None);
+            url.to_string()
+        }
+        Err(_) => "http://127.0.0.1:3737/toggle".to_string(),
+    }
+}
+
+fn request_toggle(toggle_url: String, state: Arc<Mutex<OverlayState>>) {
+    thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(8))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                let mut guard = state.lock().expect("overlay state lock poisoned");
+                guard.phase = "error".to_string();
+                guard.last_error = Some(format!("HTTP client error: {}", err));
+                guard.status_line = "Toggle failed".to_string();
+                return;
+            }
+        };
+
+        let response = client.post(&toggle_url).send();
+        let response = match response {
+            Ok(resp) => resp,
+            Err(err) => {
+                let mut guard = state.lock().expect("overlay state lock poisoned");
+                guard.phase = "error".to_string();
+                guard.last_error = Some(format!("Toggle request failed: {}", err));
+                guard.status_line = "Toggle failed".to_string();
+                return;
+            }
+        };
+
+        let status_code = response.status();
+        let body = response.text().unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+
+        let mut guard = state.lock().expect("overlay state lock poisoned");
+        if status_code.is_success() {
+            if let Some(json) = parsed {
+                if let Some(phase) = json.get("phase").and_then(|v| v.as_str()) {
+                    guard.phase = phase.to_string();
+                }
+                if let Some(message) = json.get("message").and_then(|v| v.as_str()) {
+                    guard.status_line = message.to_string();
+                } else {
+                    guard.status_line = "Toggled".to_string();
+                }
+            } else {
+                guard.status_line = "Toggled".to_string();
+            }
+            guard.last_error = None;
+        } else {
+            guard.phase = "error".to_string();
+            guard.status_line = "Toggle failed".to_string();
+            guard.last_error = Some(format!("HTTP {} {}", status_code, body));
+        }
+    });
 }
 
 fn run_sse_loop(url: String, state: Arc<Mutex<OverlayState>>) {
@@ -408,12 +521,14 @@ fn run() -> Result<(), DynError> {
 
     let opacity = runtime_cfg.opacity;
     let show_meter = runtime_cfg.show_meter;
+    let toggle_url = runtime_cfg.toggle_url.clone();
     eframe::run_native(
         "Audetic Overlay",
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(OverlayApp::new(
                 state.clone(),
+                toggle_url.clone(),
                 opacity,
                 show_meter,
             )))
