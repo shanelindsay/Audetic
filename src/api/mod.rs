@@ -74,6 +74,8 @@ impl ApiServer {
         info!("Endpoints:");
         info!("  GET  /              - Service info");
         info!("  POST /toggle        - Toggle recording");
+        info!("  POST /start         - Start recording (no toggle)");
+        info!("  POST /stop          - Stop recording (no toggle)");
         info!("  GET  /status        - Get recording status");
         info!("  GET  /version       - Get version info");
         info!("  GET  /history       - List transcription history");

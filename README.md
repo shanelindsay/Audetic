@@ -21,6 +21,13 @@ curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
 3. Press the keybind to start/stop recording!
 
+Hold-to-talk keyboard option (Hyprland press/release):
+
+```ini
+bind  = SUPER, R, exec, curl -X POST http://127.0.0.1:3737/start
+bindr = SUPER, R, exec, curl -X POST http://127.0.0.1:3737/stop
+```
+
 ## Configuration
 
 Default config at `~/.config/audetic/config.toml`. See [Configuration Guide](./docs/configuration.md) for details.

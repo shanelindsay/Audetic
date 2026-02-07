@@ -40,6 +40,10 @@ pub struct ToggleRequest {
 pub enum ApiCommand {
     /// Toggle recording with optional per-job options
     ToggleRecording(Option<JobOptions>),
+    /// Start recording only when idle/error
+    StartRecording(Option<JobOptions>),
+    /// Stop recording only when currently recording
+    StopRecording(Option<JobOptions>),
 }
 
 #[derive(Clone)]
@@ -53,6 +57,8 @@ pub struct RecordingState {
 pub fn router(state: RecordingState) -> Router {
     Router::new()
         .route("/toggle", post(toggle_recording))
+        .route("/start", post(start_recording))
+        .route("/stop", post(stop_recording))
         .route("/status", get(recording_status))
         .with_state(state)
 }
@@ -72,9 +78,42 @@ async fn toggle_recording(
     State(state): State<RecordingState>,
     body: Option<Json<ToggleRequest>>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Parse optional job options from request body
-    let job_options = body.and_then(|Json(req)| {
-        // Only create JobOptions if at least one field was specified
+    let job_options = parse_job_options(body);
+
+    info!(
+        "Toggle recording command received via API with options: {:?}",
+        job_options
+    );
+
+    dispatch_recording_command(&state, ApiCommand::ToggleRecording(job_options)).await
+}
+
+async fn start_recording(
+    State(state): State<RecordingState>,
+    body: Option<Json<ToggleRequest>>,
+) -> Result<Json<Value>, StatusCode> {
+    let job_options = parse_job_options(body);
+    info!(
+        "Start recording command received via API with options: {:?}",
+        job_options
+    );
+    dispatch_recording_command(&state, ApiCommand::StartRecording(job_options)).await
+}
+
+async fn stop_recording(
+    State(state): State<RecordingState>,
+    body: Option<Json<ToggleRequest>>,
+) -> Result<Json<Value>, StatusCode> {
+    let job_options = parse_job_options(body);
+    info!(
+        "Stop recording command received via API with options: {:?}",
+        job_options
+    );
+    dispatch_recording_command(&state, ApiCommand::StopRecording(job_options)).await
+}
+
+fn parse_job_options(body: Option<Json<ToggleRequest>>) -> Option<JobOptions> {
+    body.and_then(|Json(req)| {
         if req.copy_to_clipboard.is_some()
             || req.auto_paste.is_some()
             || req.append_newline.is_some()
@@ -89,23 +128,16 @@ async fn toggle_recording(
         } else {
             None
         }
-    });
+    })
+}
 
-    info!(
-        "Toggle recording command received via API with options: {:?}",
-        job_options
-    );
-
-    match state
-        .tx
-        .send(ApiCommand::ToggleRecording(job_options))
-        .await
-    {
+async fn dispatch_recording_command(
+    state: &RecordingState,
+    command: ApiCommand,
+) -> Result<Json<Value>, StatusCode> {
+    match state.tx.send(command).await {
         Ok(_) => {
-            // Small delay to allow the status to be updated
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            // Get the current status to return job information
             let status = state.status.get().await;
 
             Ok(Json(json!({
@@ -116,7 +148,7 @@ async fn toggle_recording(
             })))
         }
         Err(e) => {
-            error!("Failed to send toggle command: {}", e);
+            error!("Failed to send recording command: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

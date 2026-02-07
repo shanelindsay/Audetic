@@ -15,6 +15,7 @@ pub struct TextIoService {
 struct TextIoInner {
     clipboard: Mutex<Option<Clipboard>>,
     preserve_previous: bool,
+    pending_restore: Mutex<Option<String>>,
     injection_method: InjectionMethod,
 }
 
@@ -36,6 +37,7 @@ impl TextIoService {
             inner: Arc::new(TextIoInner {
                 clipboard: Mutex::new(clipboard),
                 preserve_previous,
+                pending_restore: Mutex::new(None),
                 injection_method,
             }),
         })
@@ -101,6 +103,8 @@ impl TextIoService {
 
         if let Some(prev) = previous {
             debug!("Previous clipboard content preserved: {} chars", prev.len());
+            let mut pending = self.inner.pending_restore.lock().await;
+            *pending = Some(prev);
         }
 
         Ok(())
@@ -229,6 +233,60 @@ impl TextIoService {
         ))
     }
 
+    async fn restore_preserved_clipboard(&self) -> Result<()> {
+        if !self.inner.preserve_previous {
+            return Ok(());
+        }
+
+        let previous = {
+            let mut pending = self.inner.pending_restore.lock().await;
+            pending.take()
+        };
+
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+
+        let mut restored = false;
+        {
+            let mut clipboard_guard = self.inner.clipboard.lock().await;
+            if let Some(clipboard) = clipboard_guard.as_mut() {
+                match clipboard.set_text(previous.clone()) {
+                    Ok(_) => {
+                        restored = true;
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Primary clipboard backend failed while restoring ({}), disabling until restart",
+                            err
+                        );
+                        *clipboard_guard = None;
+                    }
+                }
+            }
+        }
+
+        if !restored {
+            self.copy_with_system_backends(&previous).await?;
+        }
+
+        if which("wl-copy").is_ok() {
+            if let Ok(mut child) = Command::new("wl-copy")
+                .args(["--type", "text/plain", "--primary"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(previous.as_bytes());
+                }
+                let _ = child.wait();
+            }
+        }
+
+        debug!("Restored previous clipboard content after successful paste");
+        Ok(())
+    }
+
     fn inject_with_wtype(text: &str) -> Result<()> {
         let output = Command::new("wtype")
             .arg(text)
@@ -264,6 +322,7 @@ impl TextIoService {
 
     async fn simulate_paste(&self) -> Result<()> {
         info!("Simulating paste from clipboard");
+        let mut pasted_successfully = false;
 
         if which("ydotool").is_ok() {
             debug!("Trying ydotool paste (Ctrl+Shift+V)");
@@ -273,7 +332,7 @@ impl TextIoService {
             {
                 if output.status.success() {
                     debug!("Successfully pasted with ydotool (Ctrl+Shift+V)");
-                    return Ok(());
+                    pasted_successfully = true;
                 }
                 debug!(
                     "ydotool Ctrl+Shift+V failed: status={:?} stderr={}",
@@ -292,7 +351,7 @@ impl TextIoService {
                 {
                     if output.status.success() {
                         debug!("Successfully pasted with ydotool (Shift+Insert)");
-                        return Ok(());
+                        pasted_successfully = true;
                     }
                     debug!(
                         "ydotool Shift+Insert failed: status={:?} stderr={}",
@@ -300,24 +359,6 @@ impl TextIoService {
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
-            }
-        }
-
-        if which("ydotool").is_ok() {
-            debug!("Trying ydotool paste (Ctrl+V)");
-            if let Ok(output) = Command::new("ydotool")
-                .args(["key", "29:1", "47:1", "47:0", "29:0"])
-                .output()
-            {
-                if output.status.success() {
-                    debug!("Successfully pasted with ydotool (Ctrl+V)");
-                    return Ok(());
-                }
-                debug!(
-                    "ydotool Ctrl+V failed: status={:?} stderr={}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
-                );
             }
         }
 
@@ -330,7 +371,7 @@ impl TextIoService {
             {
                 if output.status.success() {
                     debug!("Successfully pasted with wtype (Ctrl+Shift+V)");
-                    return Ok(());
+                    pasted_successfully = true;
                 } else {
                     debug!("wtype paste failed, trying other methods");
                 }
@@ -341,9 +382,16 @@ impl TextIoService {
             if let Ok(output) = Command::new("xdotool").args(["key", "ctrl+v"]).output() {
                 if output.status.success() {
                     debug!("Successfully pasted with xdotool");
-                    return Ok(());
+                    pasted_successfully = true;
                 }
             }
+        }
+
+        if pasted_successfully {
+            if let Err(err) = self.restore_preserved_clipboard().await {
+                warn!("Failed to restore previous clipboard content: {}", err);
+            }
+            return Ok(());
         }
 
         warn!("All paste methods failed - text remains in clipboard for manual paste");

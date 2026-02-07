@@ -117,6 +117,11 @@ impl RecordingStatusHandle {
         // Keep the current_job_id during processing
     }
 
+    pub async fn set_current_job_options(&self, options: JobOptions) {
+        let mut status = self.inner.lock().await;
+        status.current_job_options = Some(options);
+    }
+
     pub async fn get_current_job_id(&self) -> Option<String> {
         self.inner.lock().await.current_job_id.clone()
     }
@@ -316,6 +321,30 @@ impl RecordingMachine {
                     job_id: current.current_job_id,
                 })
             }
+        }
+    }
+
+    /// Start recording if currently idle/error; otherwise returns current phase without side effects.
+    pub async fn start(&self, options: Option<JobOptions>) -> Result<ToggleResult> {
+        let current = self.status.get().await;
+        match current.phase {
+            RecordingPhase::Idle | RecordingPhase::Error => self.toggle(options).await,
+            _ => Ok(ToggleResult {
+                phase: current.phase,
+                job_id: current.current_job_id,
+            }),
+        }
+    }
+
+    /// Stop recording if currently recording; otherwise returns current phase without side effects.
+    pub async fn stop(&self, options: Option<JobOptions>) -> Result<ToggleResult> {
+        let current = self.status.get().await;
+        match current.phase {
+            RecordingPhase::Recording => self.toggle(options).await,
+            _ => Ok(ToggleResult {
+                phase: current.phase,
+                job_id: current.current_job_id,
+            }),
         }
     }
 

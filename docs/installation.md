@@ -252,6 +252,13 @@ Add to your Hyprland config (`~/.config/hypr/hyprland.conf`):
 bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle
 ```
 
+For hold-to-talk (press to start, release to stop):
+
+```
+bind  = SUPER, R, exec, curl -X POST http://127.0.0.1:3737/start
+bindr = SUPER, R, exec, curl -X POST http://127.0.0.1:3737/stop
+```
+
 For Omarchy users:
 ```
 bindd = SUPER, R, Audetic, exec, $terminal -e curl -X POST http://127.0.0.1:3737/toggle

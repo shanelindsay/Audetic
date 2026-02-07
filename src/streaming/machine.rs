@@ -78,6 +78,26 @@ impl StreamingMachine {
             RecordingPhase::Recording => {
                 let mut active = self.active.lock().await;
                 if let Some(session) = active.take() {
+                    if let Some(requested) = options {
+                        let mut merged = current.current_job_options.unwrap_or(JobOptions {
+                            copy_to_clipboard: true,
+                            auto_paste: self.behavior.auto_paste,
+                            append_newline: Some(self.behavior.append_newline),
+                            send_enter: Some(false),
+                        });
+
+                        merged.copy_to_clipboard = requested.copy_to_clipboard;
+                        merged.auto_paste = requested.auto_paste;
+                        if requested.append_newline.is_some() {
+                            merged.append_newline = requested.append_newline;
+                        }
+                        if requested.send_enter.is_some() {
+                            merged.send_enter = requested.send_enter;
+                        }
+
+                        self.status.set_current_job_options(merged).await;
+                    }
+
                     if let Err(e) = session.stop_tx.send(true) {
                         warn!("Failed to send stop signal for streaming session: {}", e);
                     }
@@ -102,6 +122,30 @@ impl StreamingMachine {
             }
             RecordingPhase::Processing => Ok(ToggleResult {
                 phase: RecordingPhase::Processing,
+                job_id: current.current_job_id,
+            }),
+        }
+    }
+
+    /// Start recording if currently idle/error; otherwise returns current phase without side effects.
+    pub async fn start(&self, options: Option<JobOptions>) -> Result<ToggleResult> {
+        let current = self.status.get().await;
+        match current.phase {
+            RecordingPhase::Idle | RecordingPhase::Error => self.toggle(options).await,
+            _ => Ok(ToggleResult {
+                phase: current.phase,
+                job_id: current.current_job_id,
+            }),
+        }
+    }
+
+    /// Stop recording if currently recording; otherwise returns current phase without side effects.
+    pub async fn stop(&self, options: Option<JobOptions>) -> Result<ToggleResult> {
+        let current = self.status.get().await;
+        match current.phase {
+            RecordingPhase::Recording => self.toggle(options).await,
+            _ => Ok(ToggleResult {
+                phase: current.phase,
                 job_id: current.current_job_id,
             }),
         }
@@ -197,7 +241,17 @@ async fn run_stream_task(ctx: StreamTaskContext, stop_rx: watch::Receiver<bool>)
                 let _ = ctx.indicator.show_error("No speech detected").await;
                 None
             } else {
-                if let Err(e) = apply_commit(&ctx, &text).await {
+                let effective_options = ctx
+                    .status
+                    .get_current_job_options()
+                    .await
+                    .unwrap_or(ctx.job_options);
+                info!(
+                    "Applying streaming commit job_id={} options={:?}",
+                    ctx.job_id, effective_options
+                );
+
+                if let Err(e) = apply_commit(&ctx, &text, &effective_options).await {
                     warn!("Failed to apply commit target: {}", e);
                 }
 
@@ -433,20 +487,19 @@ fn resolve_api_key(config: &StreamingConfig) -> Result<String> {
     ))
 }
 
-async fn apply_commit(ctx: &StreamTaskContext, text: &str) -> Result<()> {
+async fn apply_commit(ctx: &StreamTaskContext, text: &str, job_options: &JobOptions) -> Result<()> {
     let commit_target = ctx.config.commit_target.as_str();
 
     if commit_target == "none" {
         return Ok(());
     }
 
-    if ctx.job_options.copy_to_clipboard {
+    if job_options.copy_to_clipboard {
         ctx.text_io.copy_to_clipboard(text).await?;
     }
 
-    if commit_target == "text_io" && ctx.job_options.auto_paste {
-        let append_newline = ctx
-            .job_options
+    if commit_target == "text_io" && job_options.auto_paste {
+        let append_newline = job_options
             .append_newline
             .unwrap_or(ctx.behavior.append_newline);
         let inject_text = if append_newline {
@@ -457,12 +510,12 @@ async fn apply_commit(ctx: &StreamTaskContext, text: &str) -> Result<()> {
 
         if let Err(err) = ctx.text_io.inject_text(&inject_text).await {
             warn!("Text injection failed: {}", err);
-            if ctx.job_options.copy_to_clipboard {
+            if job_options.copy_to_clipboard {
                 let _ = ctx.text_io.paste_from_clipboard().await;
             }
         }
 
-        if ctx.job_options.send_enter.unwrap_or(false) {
+        if job_options.send_enter.unwrap_or(false) {
             tokio::time::sleep(Duration::from_millis(180)).await;
             if let Err(err) = ctx.text_io.send_enter_key().await {
                 warn!("Enter key send failed: {}", err);

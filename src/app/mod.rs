@@ -93,48 +93,52 @@ pub async fn run_service() -> Result<()> {
     while let Some(command) = rx.recv().await {
         match command {
             ApiCommand::ToggleRecording(job_options) => {
-                let toggle_result = if let Some(machine) = streaming_machine.as_ref() {
-                    machine.toggle(job_options).await
-                } else {
-                    recording_machine
-                        .as_ref()
-                        .expect("recording machine should exist when streaming is disabled")
-                        .toggle(job_options)
-                        .await
-                };
-
-                match toggle_result {
-                    Ok(ToggleResult {
-                        phase: RecordingPhase::Recording,
-                        job_id,
-                    }) => {
-                        ducking.activate().await;
-                        info!("Recording started with job_id={:?}", job_id);
-                    }
-                    Ok(ToggleResult {
-                        phase: RecordingPhase::Processing,
-                        job_id,
-                    }) => {
-                        ducking.restore().await;
-                        info!(
-                            "Recording stopped, processing audio for job_id={:?}",
-                            job_id
-                        );
-                    }
-                    Ok(ToggleResult { phase, job_id }) => {
-                        if phase != RecordingPhase::Recording {
-                            ducking.restore().await;
-                        }
-                        info!(
-                            "RecordingMachine is currently {:?} (job_id={:?})",
-                            phase, job_id
-                        );
-                    }
-                    Err(e) => {
-                        ducking.restore().await;
-                        error!("Failed to toggle recording: {}", e);
-                    }
-                }
+                handle_toggle_result(
+                    "toggle",
+                    if let Some(machine) = streaming_machine.as_ref() {
+                        machine.toggle(job_options).await
+                    } else {
+                        recording_machine
+                            .as_ref()
+                            .expect("recording machine should exist when streaming is disabled")
+                            .toggle(job_options)
+                            .await
+                    },
+                    &ducking,
+                )
+                .await;
+            }
+            ApiCommand::StartRecording(job_options) => {
+                handle_toggle_result(
+                    "start",
+                    if let Some(machine) = streaming_machine.as_ref() {
+                        machine.start(job_options).await
+                    } else {
+                        recording_machine
+                            .as_ref()
+                            .expect("recording machine should exist when streaming is disabled")
+                            .start(job_options)
+                            .await
+                    },
+                    &ducking,
+                )
+                .await;
+            }
+            ApiCommand::StopRecording(job_options) => {
+                handle_toggle_result(
+                    "stop",
+                    if let Some(machine) = streaming_machine.as_ref() {
+                        machine.stop(job_options).await
+                    } else {
+                        recording_machine
+                            .as_ref()
+                            .expect("recording machine should exist when streaming is disabled")
+                            .stop(job_options)
+                            .await
+                    },
+                    &ducking,
+                )
+                .await;
             }
         }
     }
@@ -171,5 +175,44 @@ fn spawn_update_manager() {
         Ok(Some(_handle)) => info!("Auto-update manager running in background"),
         Ok(None) => info!("Auto-update manager not started (disabled or unsupported)"),
         Err(err) => warn!("Failed to initialize auto-update manager: {err:?}"),
+    }
+}
+
+async fn handle_toggle_result(
+    action: &str,
+    toggle_result: Result<ToggleResult>,
+    ducking: &AudioDuckingController,
+) {
+    match toggle_result {
+        Ok(ToggleResult {
+            phase: RecordingPhase::Recording,
+            job_id,
+        }) => {
+            ducking.activate().await;
+            info!("Recording started via {} with job_id={:?}", action, job_id);
+        }
+        Ok(ToggleResult {
+            phase: RecordingPhase::Processing,
+            job_id,
+        }) => {
+            ducking.restore().await;
+            info!(
+                "Recording moved to processing via {} for job_id={:?}",
+                action, job_id
+            );
+        }
+        Ok(ToggleResult { phase, job_id }) => {
+            if phase != RecordingPhase::Recording {
+                ducking.restore().await;
+            }
+            info!(
+                "RecordingMachine action={} phase={:?} job_id={:?}",
+                action, phase, job_id
+            );
+        }
+        Err(e) => {
+            ducking.restore().await;
+            error!("Failed recording action {}: {}", action, e);
+        }
     }
 }
