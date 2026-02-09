@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use audetic::audio::{best_available_input_device_name, preferred_input_device_name};
 use audetic::config::{Config, OverlayConfig};
 use audetic::streaming::events::StreamEvent;
-use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
 use fs2::FileExt;
 
@@ -91,7 +91,6 @@ struct OverlayApp {
     settings_dirty: bool,
     last_settings_save_at: Option<Instant>,
     overlay_visible: bool,
-    has_seen_active_phase: bool,
     last_active_phase_at: Option<Instant>,
 }
 
@@ -222,8 +221,7 @@ impl OverlayApp {
             show_meter: ui_cfg.show_meter,
             settings_dirty: false,
             last_settings_save_at: None,
-            overlay_visible: true,
-            has_seen_active_phase: false,
+            overlay_visible: false,
             last_active_phase_at: None,
         }
     }
@@ -373,11 +371,10 @@ impl OverlayApp {
         let now = Instant::now();
         let active = matches!(phase, "recording" | "processing");
         if active {
-            self.has_seen_active_phase = true;
             self.last_active_phase_at = Some(now);
         }
 
-        let should_be_visible = if self.show_settings || active || !self.has_seen_active_phase {
+        let should_be_visible = if self.show_settings || active {
             true
         } else {
             self.last_active_phase_at
@@ -902,7 +899,7 @@ impl OverlayRuntimeConfig {
         let batch_source_label = provider_source_label(&batch_provider).to_string();
         let mic_label = detect_active_mic_name()
             .map(|name| short_mic_label(&name, 12))
-            .unwrap_or_else(|| "Unknown".to_string());
+            .unwrap_or_else(|| "Default".to_string());
 
         let mut runtime = Self {
             url: overlay_cfg.url.clone(),
@@ -963,7 +960,7 @@ impl OverlayRuntimeConfig {
             streaming_source_label: "API".to_string(),
             batch_model_label: "base".to_string(),
             batch_source_label: "Local".to_string(),
-            mic_label: "Unknown".to_string(),
+            mic_label: "Default".to_string(),
             control_mode: InputControlMode::Toggle,
             ptt_activation_delay_ms: 260,
             copy_to_clipboard: true,
@@ -1009,7 +1006,7 @@ fn provider_source_label(provider: &str) -> &'static str {
 fn is_placeholder_device_name(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
-        "" | "default" | "default input" | "pipewire"
+        "" | "default" | "default input" | "pipewire" | "pulse"
     )
 }
 
@@ -1050,32 +1047,29 @@ fn short_mic_label(name: &str, max_chars: usize) -> String {
 }
 
 fn detect_active_mic_name() -> Option<String> {
+    if let Some(name) = best_available_input_device_name() {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let mut fallback_name: Option<String> = None;
+    if let Some(name) = preferred_input_device_name() {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            if !is_placeholder_device_name(trimmed) {
+                return Some(trimmed.to_string());
+            }
+            fallback_name = Some(trimmed.to_string());
+        }
+    }
+
     if let Some(name) = default_source_name_from_wpctl() {
         return Some(name);
     }
 
-    let host = cpal::default_host();
-    if let Some(device) = host.default_input_device() {
-        if let Ok(name) = device.name() {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    if let Ok(mut devices) = host.input_devices() {
-        for device in devices.by_ref() {
-            if let Ok(name) = device.name() {
-                let trimmed = name.trim();
-                if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    None
+    fallback_name
 }
 
 fn load_runtime_config() -> OverlayRuntimeConfig {

@@ -1,11 +1,13 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
+
+use crate::audio::select_input_device_any_host;
 
 /// State of the audio recording session
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,6 +21,9 @@ pub enum RecordingState {
 pub struct AudioStreamManager {
     device: cpal::Device,
     config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    sample_rate_hz: u32,
+    channels: usize,
     samples: Arc<Mutex<Vec<f32>>>,
     active_stream: Arc<Mutex<Option<cpal::Stream>>>,
     state: Arc<Mutex<RecordingState>>,
@@ -27,23 +32,21 @@ pub struct AudioStreamManager {
 impl AudioStreamManager {
     /// Create a new audio stream manager
     pub fn new() -> Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("No input device available")?;
+        let device = select_input_device_any_host().context("No input device available")?;
 
         info!("Using audio device: {}", device.name()?);
 
-        let _config = device.default_input_config()?;
-        let config = cpal::StreamConfig {
-            channels: 1,
-            sample_rate: cpal::SampleRate(16000), // Whisper optimal
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let input_config = device.default_input_config()?;
+        let config = input_config.config();
+        let sample_rate_hz = config.sample_rate.0;
+        let channels = config.channels as usize;
 
         Ok(Self {
             device,
             config,
+            sample_format: input_config.sample_format(),
+            sample_rate_hz,
+            channels,
             samples: Arc::new(Mutex::new(Vec::new())),
             active_stream: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
@@ -75,20 +78,62 @@ impl AudioStreamManager {
         }
 
         debug!("Creating new audio stream");
+        debug!(
+            "Recording stream config: format={:?} rate={}Hz channels={}",
+            self.sample_format, self.sample_rate_hz, self.channels
+        );
 
-        let samples_clone = self.samples.clone();
         let err_fn = |err| error!("Audio stream error: {}", err);
 
-        let stream = self.device.build_input_stream(
-            &self.config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if let Ok(mut samples) = samples_clone.lock() {
-                    samples.extend_from_slice(data);
-                }
-            },
-            err_fn,
-            None,
-        )?;
+        let stream = match self.sample_format {
+            cpal::SampleFormat::F32 => {
+                let samples_clone = self.samples.clone();
+                let channels = self.channels;
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut samples) = samples_clone.lock() {
+                            extend_mono_from_f32(data, channels, &mut samples);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::I16 => {
+                let samples_clone = self.samples.clone();
+                let channels = self.channels;
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut samples) = samples_clone.lock() {
+                            extend_mono_from_i16(data, channels, &mut samples);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::U16 => {
+                let samples_clone = self.samples.clone();
+                let channels = self.channels;
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut samples) = samples_clone.lock() {
+                            extend_mono_from_u16(data, channels, &mut samples);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            sample_format => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported sample format for recording: {sample_format:?}"
+                ));
+            }
+        };
 
         stream.play()?;
         info!("Started audio recording");
@@ -136,7 +181,7 @@ impl AudioStreamManager {
         // Write WAV file
         let spec = WavSpec {
             channels: 1,
-            sample_rate: 16000,
+            sample_rate: self.sample_rate_hz,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
@@ -164,6 +209,10 @@ impl AudioStreamManager {
     pub fn drain_samples(&self) -> Vec<f32> {
         let mut samples = self.samples.lock().unwrap();
         std::mem::take(&mut *samples)
+    }
+
+    pub fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
     }
 
     /// Stop recording and discard captured audio (used for streaming mode).
@@ -210,6 +259,52 @@ impl Drop for AudioStreamManager {
     fn drop(&mut self) {
         debug!("Dropping AudioStreamManager, cleaning up resources");
         self.cleanup_stream();
+    }
+}
+
+fn extend_mono_from_f32(input: &[f32], channels: usize, out: &mut Vec<f32>) {
+    if channels <= 1 {
+        out.extend_from_slice(input);
+        return;
+    }
+
+    for frame in input.chunks(channels) {
+        let sum: f32 = frame.iter().copied().sum();
+        out.push(sum / frame.len() as f32);
+    }
+}
+
+fn extend_mono_from_i16(input: &[i16], channels: usize, out: &mut Vec<f32>) {
+    if channels <= 1 {
+        out.extend(input.iter().map(|sample| *sample as f32 / i16::MAX as f32));
+        return;
+    }
+
+    for frame in input.chunks(channels) {
+        let sum: f32 = frame
+            .iter()
+            .map(|sample| *sample as f32 / i16::MAX as f32)
+            .sum();
+        out.push(sum / frame.len() as f32);
+    }
+}
+
+fn extend_mono_from_u16(input: &[u16], channels: usize, out: &mut Vec<f32>) {
+    if channels <= 1 {
+        out.extend(
+            input
+                .iter()
+                .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0),
+        );
+        return;
+    }
+
+    for frame in input.chunks(channels) {
+        let sum: f32 = frame
+            .iter()
+            .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+            .sum();
+        out.push(sum / frame.len() as f32);
     }
 }
 

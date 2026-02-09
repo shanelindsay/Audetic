@@ -95,7 +95,9 @@ impl AudioDuckingController {
 
 fn duck_default_sink(target_volume: f32) -> Result<DuckState> {
     let (previous_volume, previous_muted) = get_default_sink_state()?;
-    set_default_sink_volume(target_volume)?;
+    if (previous_volume - target_volume).abs() > 0.005 {
+        set_default_sink_volume(target_volume)?;
+    }
 
     Ok(DuckState {
         active: true,
@@ -105,12 +107,20 @@ fn duck_default_sink(target_volume: f32) -> Result<DuckState> {
 }
 
 fn restore_default_sink(state: DuckState) -> Result<()> {
-    set_default_sink_volume(state.previous_volume)?;
-    if state.previous_muted {
-        run_wpctl(["set-mute", "@DEFAULT_AUDIO_SINK@", "1"])?;
-    } else {
-        run_wpctl(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"])?;
+    let (current_volume, current_muted) = get_default_sink_state()?;
+
+    if (current_volume - state.previous_volume).abs() > 0.005 {
+        set_default_sink_volume(state.previous_volume)?;
     }
+
+    if current_muted != state.previous_muted {
+        if state.previous_muted {
+            run_wpctl(["set-mute", "@DEFAULT_AUDIO_SINK@", "1"])?;
+        } else {
+            run_wpctl(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"])?;
+        }
+    }
+
     Ok(())
 }
 

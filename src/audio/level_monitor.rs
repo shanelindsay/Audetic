@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::audio::{RecordingPhase, RecordingStatusHandle};
+use crate::audio::{select_input_device_any_host, RecordingPhase, RecordingStatusHandle};
 use crate::streaming::StreamHub;
 
 const METER_TICK_MS: u64 = 33;
@@ -54,10 +54,7 @@ pub fn spawn_idle_level_monitor(status: RecordingStatusHandle, hub: Arc<StreamHu
 }
 
 fn run_input_level_stream(level_tx: mpsc::Sender<(f32, f32, bool)>) -> anyhow::Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No default input device available"))?;
+    let device = select_input_device_any_host()?;
     let config = device.default_input_config()?;
     let stream_config = config.config();
 

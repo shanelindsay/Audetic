@@ -11,8 +11,9 @@ use fs2::FileExt;
 use ksni::blocking::TrayMethods;
 use serde::Deserialize;
 
-const STATUS_URL: &str = "http://127.0.0.1:3737/status";
-const TOGGLE_URL: &str = "http://127.0.0.1:3737/toggle";
+const API_BASE_URL: &str = "http://127.0.0.1:3737";
+const STATUS_PATH: &str = "/status";
+const TOGGLE_PATH: &str = "/toggle";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayPhase {
@@ -88,7 +89,7 @@ impl AudeticTray {
     }
 
     fn service_reachable(&self) -> bool {
-        fetch_status().is_some()
+        fetch_status().is_ok()
     }
 
     fn ensure_service_running(&mut self) -> bool {
@@ -136,22 +137,14 @@ impl AudeticTray {
     }
 
     fn toggle_recording(&mut self) {
-        let _ = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_millis(350))
-            .timeout(Duration::from_secs(3))
-            .build()
-            .and_then(|client| client.post(TOGGLE_URL).send())
-            .map(|_| self.clear_error())
-            .map_err(|err| self.set_error(format!("Toggle failed: {err}")));
+        match http_request("POST", TOGGLE_PATH) {
+            Ok(_) => self.clear_error(),
+            Err(err) => self.set_error(format!("Toggle failed: {err}")),
+        }
     }
 
     fn activate_primary_action(&mut self) {
         if !self.ensure_service_running() {
-            return;
-        }
-
-        if !self.is_overlay_running() {
-            self.open_overlay();
             return;
         }
 
@@ -275,28 +268,17 @@ fn overlay_lock_file() -> Result<File> {
         .context("Failed to open overlay lock file")
 }
 
-fn fetch_status() -> Option<StatusResponse> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_millis(350))
-        .timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let response = client.get(STATUS_URL).send().ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.json::<StatusResponse>().ok()
+fn fetch_status() -> Result<StatusResponse> {
+    let body = http_request("GET", STATUS_PATH)?;
+    serde_json::from_str::<StatusResponse>(&body).context("Failed to parse /status JSON")
 }
 
-fn fetch_phase() -> (TrayPhase, Option<String>) {
-    fetch_status()
-        .map(|payload| {
-            (
-                TrayPhase::from_api(payload.phase.as_str()),
-                payload.last_error,
-            )
-        })
-        .unwrap_or((TrayPhase::Unknown, None))
+fn fetch_phase() -> Result<(TrayPhase, Option<String>)> {
+    let payload = fetch_status()?;
+    Ok((
+        TrayPhase::from_api(payload.phase.as_str()),
+        payload.last_error,
+    ))
 }
 
 fn try_acquire_instance_lock() -> Result<Option<File>> {
@@ -317,6 +299,31 @@ fn try_acquire_instance_lock() -> Result<Option<File>> {
     }
 }
 
+fn http_request(method: &str, path: &str) -> Result<String> {
+    let url = format!("{API_BASE_URL}{path}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(350))
+        .timeout_read(Duration::from_secs(3))
+        .timeout_write(Duration::from_secs(1))
+        .build();
+
+    let response = if method.eq_ignore_ascii_case("POST") {
+        agent
+            .post(&url)
+            .call()
+            .map_err(|err| anyhow::anyhow!("HTTP POST failed: {err}"))?
+    } else {
+        agent
+            .get(&url)
+            .call()
+            .map_err(|err| anyhow::anyhow!("HTTP GET failed: {err}"))?
+    };
+
+    response
+        .into_string()
+        .context("Failed to read HTTP response body")
+}
+
 fn run() -> Result<()> {
     let _instance_lock = match try_acquire_instance_lock()? {
         Some(lock) => lock,
@@ -333,11 +340,20 @@ fn run() -> Result<()> {
     let handle = tray.spawn().context("Failed to start tray icon")?;
 
     thread::spawn(move || loop {
-        let (phase, last_error) = fetch_phase();
-        handle.update(|tray: &mut AudeticTray| {
-            tray.phase = phase;
-            tray.last_error = last_error.clone();
-        });
+        match fetch_phase() {
+            Ok((phase, last_error)) => {
+                handle.update(|tray: &mut AudeticTray| {
+                    tray.phase = phase;
+                    tray.last_error = last_error.clone();
+                });
+            }
+            Err(err) => {
+                eprintln!("audetic-tray: status poll failed: {err}");
+                handle.update(|tray: &mut AudeticTray| {
+                    tray.last_error = Some(format!("Status poll failed: {err}"));
+                });
+            }
+        }
         thread::sleep(Duration::from_millis(420));
     });
 

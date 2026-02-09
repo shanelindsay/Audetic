@@ -323,19 +323,28 @@ impl TextIoService {
     async fn simulate_paste(&self) -> Result<()> {
         info!("Simulating paste from clipboard");
         let mut pasted_successfully = false;
+        let mut try_mark_pasted = |success: bool| -> bool {
+            if success {
+                pasted_successfully = true;
+            }
+            pasted_successfully
+        };
 
         if which("ydotool").is_ok() {
-            debug!("Trying ydotool paste (Ctrl+Shift+V)");
+            debug!("Trying ydotool paste (Ctrl+V)");
             if let Ok(output) = Command::new("ydotool")
-                .args(["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+                .args(["key", "29:1", "47:1", "47:0", "29:0"])
                 .output()
             {
-                if output.status.success() {
-                    debug!("Successfully pasted with ydotool (Ctrl+Shift+V)");
-                    pasted_successfully = true;
+                if try_mark_pasted(output.status.success()) {
+                    debug!("Successfully pasted with ydotool (Ctrl+V)");
+                    if let Err(err) = self.restore_preserved_clipboard().await {
+                        warn!("Failed to restore previous clipboard content: {}", err);
+                    }
+                    return Ok(());
                 }
                 debug!(
-                    "ydotool Ctrl+Shift+V failed: status={:?} stderr={}",
+                    "ydotool Ctrl+V failed: status={:?} stderr={}",
                     output.status.code(),
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -349,9 +358,12 @@ impl TextIoService {
                     .args(["key", "42:1", "110:1", "110:0", "42:0"])
                     .output()
                 {
-                    if output.status.success() {
+                    if try_mark_pasted(output.status.success()) {
                         debug!("Successfully pasted with ydotool (Shift+Insert)");
-                        pasted_successfully = true;
+                        if let Err(err) = self.restore_preserved_clipboard().await {
+                            warn!("Failed to restore previous clipboard content: {}", err);
+                        }
+                        return Ok(());
                     }
                     debug!(
                         "ydotool Shift+Insert failed: status={:?} stderr={}",
@@ -364,14 +376,15 @@ impl TextIoService {
 
         if which("wtype").is_ok() {
             if let Ok(output) = Command::new("wtype")
-                .args([
-                    "-M", "ctrl", "-M", "shift", "-P", "v", "-m", "shift", "-m", "ctrl",
-                ])
+                .args(["-M", "ctrl", "-P", "v", "-m", "ctrl"])
                 .output()
             {
-                if output.status.success() {
-                    debug!("Successfully pasted with wtype (Ctrl+Shift+V)");
-                    pasted_successfully = true;
+                if try_mark_pasted(output.status.success()) {
+                    debug!("Successfully pasted with wtype (Ctrl+V)");
+                    if let Err(err) = self.restore_preserved_clipboard().await {
+                        warn!("Failed to restore previous clipboard content: {}", err);
+                    }
+                    return Ok(());
                 } else {
                     debug!("wtype paste failed, trying other methods");
                 }
@@ -380,17 +393,17 @@ impl TextIoService {
 
         if which("xdotool").is_ok() {
             if let Ok(output) = Command::new("xdotool").args(["key", "ctrl+v"]).output() {
-                if output.status.success() {
+                if try_mark_pasted(output.status.success()) {
                     debug!("Successfully pasted with xdotool");
-                    pasted_successfully = true;
+                    if let Err(err) = self.restore_preserved_clipboard().await {
+                        warn!("Failed to restore previous clipboard content: {}", err);
+                    }
+                    return Ok(());
                 }
             }
         }
 
         if pasted_successfully {
-            if let Err(err) = self.restore_preserved_clipboard().await {
-                warn!("Failed to restore previous clipboard content: {}", err);
-            }
             return Ok(());
         }
 

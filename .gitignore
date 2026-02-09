@@ -31,3 +31,6 @@ Thumbs.db
 node_modules/
 
 .env*
+
+# Local issue tracker metadata (not used in this repo)
+.beads/

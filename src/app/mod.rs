@@ -62,6 +62,16 @@ pub async fn run_service() -> Result<()> {
             "Streaming mode enabled with provider={} model={}",
             config.streaming.provider, config.streaming.model
         );
+        let detected_sample_rate = {
+            let recorder = audio_recorder.lock().await;
+            recorder.sample_rate_hz()
+        };
+        let mut streaming_cfg = config.streaming.clone();
+        streaming_cfg.sample_rate_hz = detected_sample_rate;
+        info!(
+            "Streaming capture sample rate detected at {}Hz",
+            streaming_cfg.sample_rate_hz
+        );
 
         Some(StreamingMachine::new(
             audio_recorder.clone(),
@@ -70,7 +80,7 @@ pub async fn run_service() -> Result<()> {
             behavior,
             status_handle.clone(),
             stream_hub.clone(),
-            config.streaming.clone(),
+            streaming_cfg,
         ))
     } else {
         None
