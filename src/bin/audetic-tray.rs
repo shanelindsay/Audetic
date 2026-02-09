@@ -64,11 +64,70 @@ struct StatusResponse {
 struct AudeticTray {
     phase: TrayPhase,
     last_error: Option<String>,
+    audetic_command: PathBuf,
     overlay_command: PathBuf,
 }
 
 impl AudeticTray {
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.last_error = Some(message.into());
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
+    }
+
+    fn start_service(&mut self) -> Result<()> {
+        Command::new(&self.audetic_command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn audetic service")?;
+        Ok(())
+    }
+
+    fn service_reachable(&self) -> bool {
+        fetch_status().is_some()
+    }
+
+    fn ensure_service_running(&mut self) -> bool {
+        if self.service_reachable() {
+            return true;
+        }
+
+        if let Err(err) = self.start_service() {
+            self.set_error(err.to_string());
+            return false;
+        }
+
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(120));
+            if self.service_reachable() {
+                self.clear_error();
+                return true;
+            }
+        }
+
+        self.set_error("Audetic service did not start");
+        false
+    }
+
+    fn is_overlay_running(&self) -> bool {
+        overlay_lock_file()
+            .ok()
+            .map(|file| match file.try_lock_exclusive() {
+                Ok(()) => false,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => true,
+                Err(_) => false,
+            })
+            .unwrap_or(false)
+    }
+
     fn open_overlay(&self) {
+        if self.is_overlay_running() {
+            return;
+        }
         let _ = Command::new(&self.overlay_command)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -76,12 +135,27 @@ impl AudeticTray {
             .spawn();
     }
 
-    fn toggle_recording(&self) {
+    fn toggle_recording(&mut self) {
         let _ = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_millis(350))
             .timeout(Duration::from_secs(3))
             .build()
-            .and_then(|client| client.post(TOGGLE_URL).send());
+            .and_then(|client| client.post(TOGGLE_URL).send())
+            .map(|_| self.clear_error())
+            .map_err(|err| self.set_error(format!("Toggle failed: {err}")));
+    }
+
+    fn activate_primary_action(&mut self) {
+        if !self.ensure_service_running() {
+            return;
+        }
+
+        if !self.is_overlay_running() {
+            self.open_overlay();
+            return;
+        }
+
+        self.toggle_recording();
     }
 }
 
@@ -113,7 +187,7 @@ impl ksni::Tray for AudeticTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.open_overlay();
+        self.activate_primary_action();
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -185,32 +259,44 @@ fn overlay_command() -> PathBuf {
     resolve_sibling_binary("audetic-overlay").unwrap_or_else(|| PathBuf::from("audetic-overlay"))
 }
 
-fn fetch_phase() -> (TrayPhase, Option<String>) {
-    let client = match reqwest::blocking::Client::builder()
+fn audetic_command() -> PathBuf {
+    resolve_sibling_binary("audetic").unwrap_or_else(|| PathBuf::from("audetic"))
+}
+
+fn overlay_lock_file() -> Result<File> {
+    let data_dir = global::data_dir()?;
+    fs::create_dir_all(&data_dir).context("Failed to create Audetic data directory")?;
+    let lock_path = data_dir.join("overlay.lock");
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .context("Failed to open overlay lock file")
+}
+
+fn fetch_status() -> Option<StatusResponse> {
+    let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_millis(350))
         .timeout(Duration::from_secs(2))
         .build()
-    {
-        Ok(client) => client,
-        Err(_) => return (TrayPhase::Unknown, None),
-    };
-
-    let response = match client.get(STATUS_URL).send() {
-        Ok(response) => response,
-        Err(_) => return (TrayPhase::Unknown, None),
-    };
-
+        .ok()?;
+    let response = client.get(STATUS_URL).send().ok()?;
     if !response.status().is_success() {
-        return (TrayPhase::Unknown, None);
+        return None;
     }
+    response.json::<StatusResponse>().ok()
+}
 
-    match response.json::<StatusResponse>() {
-        Ok(payload) => (
-            TrayPhase::from_api(payload.phase.as_str()),
-            payload.last_error,
-        ),
-        Err(_) => (TrayPhase::Unknown, None),
-    }
+fn fetch_phase() -> (TrayPhase, Option<String>) {
+    fetch_status()
+        .map(|payload| {
+            (
+                TrayPhase::from_api(payload.phase.as_str()),
+                payload.last_error,
+            )
+        })
+        .unwrap_or((TrayPhase::Unknown, None))
 }
 
 fn try_acquire_instance_lock() -> Result<Option<File>> {
@@ -240,6 +326,7 @@ fn run() -> Result<()> {
     let tray = AudeticTray {
         phase: TrayPhase::Unknown,
         last_error: None,
+        audetic_command: audetic_command(),
         overlay_command: overlay_command(),
     };
 

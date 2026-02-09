@@ -1,6 +1,10 @@
 use std::collections::VecDeque;
+use std::f32::consts::TAU;
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,8 +13,14 @@ use audetic::config::{Config, OverlayConfig};
 use audetic::streaming::events::StreamEvent;
 use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui;
+use fs2::FileExt;
 
 type DynError = Box<dyn std::error::Error>;
+const WAVE_HISTORY_CAP: usize = 260;
+const WAVE_BAR_COUNT: usize = 64;
+const OVERLAY_HIDE_DELAY_MS: u64 = 1300;
+const METER_FLOOR_DBFS: f32 = -58.0;
+const METER_GATE_DBFS: f32 = -52.0;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct OutputModeState {
@@ -28,6 +38,7 @@ struct OverlayState {
     partial_text: String,
     recent_finals: VecDeque<String>,
     meter_level: f32,
+    meter_history: VecDeque<f32>,
     clipping: bool,
     last_error: Option<String>,
 }
@@ -41,6 +52,7 @@ impl Default for OverlayState {
             partial_text: String::new(),
             recent_finals: VecDeque::new(),
             meter_level: 0.0,
+            meter_history: VecDeque::new(),
             clipping: false,
             last_error: None,
         }
@@ -76,6 +88,11 @@ struct OverlayApp {
     preserve_clipboard: bool,
     opacity: f32,
     show_meter: bool,
+    settings_dirty: bool,
+    last_settings_save_at: Option<Instant>,
+    overlay_visible: bool,
+    has_seen_active_phase: bool,
+    last_active_phase_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +220,11 @@ impl OverlayApp {
             preserve_clipboard: ui_cfg.preserve_clipboard,
             opacity: ui_cfg.opacity,
             show_meter: ui_cfg.show_meter,
+            settings_dirty: false,
+            last_settings_save_at: None,
+            overlay_visible: true,
+            has_seen_active_phase: false,
+            last_active_phase_at: None,
         }
     }
 
@@ -322,6 +344,52 @@ impl OverlayApp {
         };
         persist_overlay_settings(update, self.state.clone());
     }
+
+    fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
+    }
+
+    fn maybe_autosave_settings(&mut self, force: bool) {
+        if !self.settings_dirty {
+            return;
+        }
+
+        let now = Instant::now();
+        let should_save = force
+            || self
+                .last_settings_save_at
+                .map(|last| now.duration_since(last) >= Duration::from_millis(320))
+                .unwrap_or(true);
+        if !should_save {
+            return;
+        }
+
+        self.save_settings();
+        self.last_settings_save_at = Some(now);
+        self.settings_dirty = false;
+    }
+
+    fn sync_overlay_visibility(&mut self, ctx: &egui::Context, phase: &str) {
+        let now = Instant::now();
+        let active = matches!(phase, "recording" | "processing");
+        if active {
+            self.has_seen_active_phase = true;
+            self.last_active_phase_at = Some(now);
+        }
+
+        let should_be_visible = if self.show_settings || active || !self.has_seen_active_phase {
+            true
+        } else {
+            self.last_active_phase_at
+                .map(|last| now.duration_since(last) < Duration::from_millis(OVERLAY_HIDE_DELAY_MS))
+                .unwrap_or(false)
+        };
+
+        if should_be_visible != self.overlay_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_be_visible));
+            self.overlay_visible = should_be_visible;
+        }
+    }
 }
 
 fn output_mode_from_flags(
@@ -426,6 +494,8 @@ impl eframe::App for OverlayApp {
             .fill(bg)
             .inner_margin(egui::Margin::same(12.0));
 
+        self.sync_overlay_visibility(ctx, snapshot.phase.as_str());
+
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
@@ -433,7 +503,7 @@ impl eframe::App for OverlayApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Settings")
+                                egui::RichText::new("Options ⚙")
                                     .strong()
                                     .color(egui::Color32::WHITE),
                             )
@@ -442,7 +512,16 @@ impl eframe::App for OverlayApp {
                         )
                         .clicked()
                     {
-                        self.show_settings = !self.show_settings;
+                        if self.show_settings {
+                            self.maybe_autosave_settings(true);
+                            self.show_settings = false;
+                        } else {
+                            self.show_settings = true;
+                            if !self.overlay_visible {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                self.overlay_visible = true;
+                            }
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let is_recording = snapshot.phase == "recording";
@@ -523,7 +602,41 @@ impl eframe::App for OverlayApp {
                     );
                 });
 
+                if self.show_meter {
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_unmultiplied(18, 22, 28, 210))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            draw_audio_waveform(
+                                ui,
+                                &snapshot.meter_history,
+                                snapshot.meter_level,
+                                snapshot.phase.as_str(),
+                                snapshot.clipping,
+                            );
+                            ui.horizontal(|ui| {
+                                let pct = (snapshot.meter_level * 100.0).round() as i32;
+                                let colour = if snapshot.phase == "recording" {
+                                    egui::Color32::from_rgb(255, 214, 102)
+                                } else {
+                                    egui::Color32::from_rgb(165, 188, 215)
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("Level: {pct}%")).color(colour),
+                                );
+                                if snapshot.clipping {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 96, 96), "CLIP");
+                                }
+                            });
+                        });
+                }
+
                 if self.show_settings {
+                    let mut options_changed = false;
+                    let mut close_clicked = false;
+
                     ui.add_space(6.0);
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(31, 35, 41))
@@ -531,81 +644,114 @@ impl eframe::App for OverlayApp {
                         .inner_margin(egui::Margin::same(10.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Settings").strong());
+                                ui.label(egui::RichText::new("Options").strong());
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui.button("Close").clicked() {
-                                            self.show_settings = false;
+                                            close_clicked = true;
                                         }
                                     },
                                 );
                             });
 
                             ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Control mode:");
-                                if ui
-                                    .selectable_label(
-                                        self.control_mode == InputControlMode::Toggle,
-                                        "Tap",
-                                    )
-                                    .clicked()
-                                {
-                                    self.set_control_mode(InputControlMode::Toggle);
-                                }
-                                if ui
-                                    .selectable_label(
-                                        self.control_mode == InputControlMode::Hold,
-                                        "Hold",
-                                    )
-                                    .clicked()
-                                {
-                                    self.set_control_mode(InputControlMode::Hold);
-                                }
-                            });
+                            let settings_max_height = (ui.available_height() - 8.0).max(140.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(settings_max_height)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Control mode:");
+                                        if ui
+                                            .selectable_label(
+                                                self.control_mode == InputControlMode::Toggle,
+                                                "Tap",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.set_control_mode(InputControlMode::Toggle);
+                                            options_changed = true;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.control_mode == InputControlMode::Hold,
+                                                "Hold",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.set_control_mode(InputControlMode::Hold);
+                                            options_changed = true;
+                                        }
+                                    });
 
-                            ui.horizontal(|ui| {
-                                ui.label("Hold delay:");
-                                ui.add(
-                                    egui::Slider::new(&mut self.ptt_activation_delay_ms, 120..=800)
-                                        .suffix(" ms")
-                                        .clamping(egui::SliderClamping::Always),
-                                );
-                            });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Hold delay:");
+                                        let hold_delay = ui.add(
+                                            egui::Slider::new(
+                                                &mut self.ptt_activation_delay_ms,
+                                                120..=800,
+                                            )
+                                            .suffix(" ms")
+                                            .clamping(egui::SliderClamping::Always),
+                                        );
+                                        options_changed |= hold_delay.changed();
+                                    });
 
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.show_meter, "Show mic meter");
-                                ui.label("Overlay opacity:");
-                                ui.add(egui::Slider::new(&mut self.opacity, 0.45..=1.0));
-                            });
+                                    ui.horizontal(|ui| {
+                                        let meter_toggle =
+                                            ui.checkbox(&mut self.show_meter, "Show mic meter");
+                                        ui.label("Overlay opacity:");
+                                        let opacity_slider = ui
+                                            .add(egui::Slider::new(&mut self.opacity, 0.45..=1.0));
+                                        options_changed |=
+                                            meter_toggle.changed() || opacity_slider.changed();
+                                    });
 
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.audio_ducking, "Audio ducking");
-                                ui.add_enabled(
-                                    self.audio_ducking,
-                                    egui::Slider::new(
-                                        &mut self.ducking_level_percent,
-                                        5_u8..=95_u8,
-                                    )
-                                    .suffix(" %"),
-                                );
-                            });
+                                    ui.horizontal(|ui| {
+                                        let ducking_toggle =
+                                            ui.checkbox(&mut self.audio_ducking, "Audio ducking");
+                                        let ducking_slider = ui.add_enabled(
+                                            self.audio_ducking,
+                                            egui::Slider::new(
+                                                &mut self.ducking_level_percent,
+                                                5_u8..=95_u8,
+                                            )
+                                            .suffix(" %"),
+                                        );
+                                        options_changed |=
+                                            ducking_toggle.changed() || ducking_slider.changed();
+                                    });
 
-                            ui.horizontal(|ui| {
-                                ui.checkbox(
-                                    &mut self.preserve_clipboard,
-                                    "Restore clipboard after paste",
-                                );
-                            });
+                                    ui.horizontal(|ui| {
+                                        let preserve_clipboard = ui.checkbox(
+                                            &mut self.preserve_clipboard,
+                                            "Restore clipboard after paste",
+                                        );
+                                        options_changed |= preserve_clipboard.changed();
+                                    });
 
-                            if ui.button("Save settings").clicked() {
-                                self.save_settings();
-                            }
+                                    if ui.button("Save settings").clicked() {
+                                        self.save_settings();
+                                        self.last_settings_save_at = Some(Instant::now());
+                                        self.settings_dirty = false;
+                                    }
+                                });
                         });
+
+                    if options_changed {
+                        self.mark_settings_dirty();
+                    }
+
+                    if close_clicked {
+                        self.show_settings = false;
+                        self.maybe_autosave_settings(true);
+                    } else {
+                        self.maybe_autosave_settings(false);
+                    }
                 }
 
-                if self.control_mode == InputControlMode::Hold {
+                if !self.show_settings && self.control_mode == InputControlMode::Hold {
                     let is_recording = snapshot.phase == "recording";
                     if self.ptt_start_requested && is_recording {
                         self.ptt_start_requested = false;
@@ -664,27 +810,11 @@ impl eframe::App for OverlayApp {
                         self.ptt_button_down = is_down;
                         ui.label("Hold to talk (quick taps are ignored).");
                     });
-                } else {
+                } else if !self.show_settings {
                     self.reset_hold_state();
                 }
 
-                if self.show_meter {
-                    let meter_fill = if snapshot.phase == "recording" {
-                        egui::Color32::from_rgb(220, 72, 72)
-                    } else {
-                        egui::Color32::from_rgb(66, 133, 244)
-                    };
-                    let meter = egui::ProgressBar::new(snapshot.meter_level)
-                        .fill(meter_fill)
-                        .show_percentage();
-                    ui.add(meter);
-
-                    if snapshot.clipping {
-                        ui.colored_label(egui::Color32::from_rgb(255, 96, 96), "Clipping detected");
-                    }
-                }
-
-                if !snapshot.partial_text.trim().is_empty() {
+                if !self.show_settings && !snapshot.partial_text.trim().is_empty() {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(snapshot.partial_text)
@@ -693,21 +823,25 @@ impl eframe::App for OverlayApp {
                     );
                 }
 
-                egui::ScrollArea::vertical()
-                    .max_height(110.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in snapshot.recent_finals.into_iter().rev() {
-                            ui.label(line);
-                        }
-                    });
+                if !self.show_settings {
+                    egui::ScrollArea::vertical()
+                        .max_height(110.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for line in snapshot.recent_finals.into_iter().rev() {
+                                ui.label(line);
+                            }
+                        });
+                }
 
-                if let Some(err) = snapshot.last_error {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 96, 96),
-                        format!("Error: {}", err),
-                    );
+                if !self.show_settings {
+                    if let Some(err) = snapshot.last_error {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 96, 96),
+                            format!("Error: {}", err),
+                        );
+                    }
                 }
             });
     }
@@ -766,7 +900,9 @@ impl OverlayRuntimeConfig {
             .clone()
             .unwrap_or_else(|| "<default>".to_string());
         let batch_source_label = provider_source_label(&batch_provider).to_string();
-        let mic_label = detect_active_mic_name().unwrap_or_else(|| "Unknown".to_string());
+        let mic_label = detect_active_mic_name()
+            .map(|name| short_mic_label(&name, 12))
+            .unwrap_or_else(|| "Unknown".to_string());
 
         let mut runtime = Self {
             url: overlay_cfg.url.clone(),
@@ -870,16 +1006,76 @@ fn provider_source_label(provider: &str) -> &'static str {
     }
 }
 
-fn detect_active_mic_name() -> Option<String> {
-    let host = cpal::default_host();
-    let device = host.default_input_device()?;
-    let name = device.name().ok()?;
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+fn is_placeholder_device_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "" | "default" | "default input" | "pipewire"
+    )
+}
+
+fn parse_wpctl_field(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(key) {
+            return None;
+        }
+        let value = trimmed.split_once('=')?.1.trim().trim_matches('"').trim();
+        if value.is_empty() || is_placeholder_device_name(value) {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+fn default_source_name_from_wpctl() -> Option<String> {
+    let output = Command::new("wpctl")
+        .args(["inspect", "@DEFAULT_AUDIO_SOURCE@"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let text = String::from_utf8(output.stdout).ok()?;
+    parse_wpctl_field(&text, "node.description")
+        .or_else(|| parse_wpctl_field(&text, "node.nick"))
+        .or_else(|| parse_wpctl_field(&text, "device.description"))
+}
+
+fn short_mic_label(name: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    name.chars().take(max_chars).collect()
+}
+
+fn detect_active_mic_name() -> Option<String> {
+    if let Some(name) = default_source_name_from_wpctl() {
+        return Some(name);
+    }
+
+    let host = cpal::default_host();
+    if let Some(device) = host.default_input_device() {
+        if let Ok(name) = device.name() {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(mut devices) = host.input_devices() {
+        for device in devices.by_ref() {
+            if let Ok(name) = device.name() {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn load_runtime_config() -> OverlayRuntimeConfig {
@@ -890,72 +1086,66 @@ fn load_runtime_config() -> OverlayRuntimeConfig {
 }
 
 fn persist_engine_mode(mode: EngineMode, state: Arc<Mutex<OverlayState>>) {
-    thread::spawn(move || {
-        let save_result = (|| -> Result<(), String> {
-            let mut config =
-                Config::load().map_err(|err| format!("Failed to load config: {err}"))?;
-            config.streaming.enabled = mode.is_streaming();
-            config
-                .save()
-                .map_err(|err| format!("Failed to save config: {err}"))?;
-            Ok(())
-        })();
+    let save_result = (|| -> Result<(), String> {
+        let mut config = Config::load().map_err(|err| format!("Failed to load config: {err}"))?;
+        config.streaming.enabled = mode.is_streaming();
+        config
+            .save()
+            .map_err(|err| format!("Failed to save config: {err}"))?;
+        Ok(())
+    })();
 
-        let mut guard = state.lock().expect("overlay state lock poisoned");
-        match save_result {
-            Ok(()) => {
-                guard.last_error = None;
-                guard.status_line = format!(
-                    "Engine set to {}. Restart Audetic service to apply.",
-                    mode.label()
-                );
-            }
-            Err(err) => {
-                guard.phase = "error".to_string();
-                guard.last_error = Some(err.clone());
-                guard.status_line = err;
-            }
+    let mut guard = state.lock().expect("overlay state lock poisoned");
+    match save_result {
+        Ok(()) => {
+            guard.last_error = None;
+            guard.status_line = format!(
+                "Engine set to {}. Restart Audetic service to apply.",
+                mode.label()
+            );
         }
-    });
+        Err(err) => {
+            guard.phase = "error".to_string();
+            guard.last_error = Some(err.clone());
+            guard.status_line = err;
+        }
+    }
 }
 
 fn persist_overlay_settings(update: OverlaySettingsUpdate, state: Arc<Mutex<OverlayState>>) {
-    thread::spawn(move || {
-        let save_result = (|| -> Result<(), String> {
-            persist_overlay_ui_state(OverlayUiState {
-                control_mode: update.control_mode,
-                ptt_activation_delay_ms: update.ptt_activation_delay_ms.clamp(120, 800),
-                opacity: update.opacity.clamp(0.45, 1.0),
-                show_meter: update.show_meter,
-            })?;
+    let save_result = (|| -> Result<(), String> {
+        persist_overlay_ui_state(OverlayUiState {
+            control_mode: update.control_mode,
+            ptt_activation_delay_ms: update.ptt_activation_delay_ms.clamp(120, 800),
+            opacity: update.opacity.clamp(0.45, 1.0),
+            show_meter: update.show_meter,
+        })?;
 
-            let mut config =
-                Config::load().map_err(|err| format!("Failed to load config: {err}"))?;
-            config.overlay.opacity = update.opacity.clamp(0.45, 1.0);
-            config.overlay.show_meter = update.show_meter;
-            config.behavior.audio_ducking = update.audio_ducking;
-            config.behavior.ducking_level_percent = update.ducking_level_percent.clamp(5, 95);
-            config.behavior.preserve_clipboard = update.preserve_clipboard;
-            config
-                .save()
-                .map_err(|err| format!("Failed to save config: {err}"))?;
-            Ok(())
-        })();
+        let mut config = Config::load().map_err(|err| format!("Failed to load config: {err}"))?;
+        config.overlay.opacity = update.opacity.clamp(0.45, 1.0);
+        config.overlay.show_meter = update.show_meter;
+        config.behavior.audio_ducking = update.audio_ducking;
+        config.behavior.ducking_level_percent = update.ducking_level_percent.clamp(5, 95);
+        config.behavior.preserve_clipboard = update.preserve_clipboard;
+        config
+            .save()
+            .map_err(|err| format!("Failed to save config: {err}"))?;
+        Ok(())
+    })();
 
-        let mut guard = state.lock().expect("overlay state lock poisoned");
-        match save_result {
-            Ok(()) => {
-                guard.last_error = None;
-                guard.status_line =
-                    "Settings saved (restart service to apply behaviour changes).".to_string();
-            }
-            Err(err) => {
-                guard.phase = "error".to_string();
-                guard.last_error = Some(err.clone());
-                guard.status_line = err;
-            }
+    let mut guard = state.lock().expect("overlay state lock poisoned");
+    match save_result {
+        Ok(()) => {
+            guard.last_error = None;
+            guard.status_line =
+                "Settings saved (restart service to apply behaviour changes).".to_string();
         }
-    });
+        Err(err) => {
+            guard.phase = "error".to_string();
+            guard.last_error = Some(err.clone());
+            guard.status_line = err;
+        }
+    }
 }
 
 fn draw_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_color: egui::Color32) {
@@ -985,9 +1175,143 @@ fn draw_clickable_badge(
 }
 
 fn dbfs_to_level(dbfs: f32) -> f32 {
-    let floor = -72.0;
-    let normalized = (dbfs - floor) / (0.0 - floor);
-    normalized.clamp(0.0, 1.0).powf(0.55)
+    if dbfs <= METER_GATE_DBFS {
+        return 0.0;
+    }
+    let normalized = (dbfs - METER_FLOOR_DBFS) / (0.0 - METER_FLOOR_DBFS);
+    normalized.clamp(0.0, 1.0).powf(1.25)
+}
+
+fn sample_meter_history(history: &VecDeque<f32>, current_level: f32, samples: usize) -> Vec<f32> {
+    if samples == 0 {
+        return Vec::new();
+    }
+    if history.is_empty() {
+        return vec![current_level.clamp(0.0, 1.0); samples];
+    }
+    if history.len() <= samples {
+        let mut padded = vec![current_level.clamp(0.0, 1.0) * 0.55; samples - history.len()];
+        padded.extend(history.iter().copied());
+        return padded;
+    }
+
+    let len = history.len();
+    let step = (len.saturating_sub(1)) as f32 / (samples.saturating_sub(1).max(1)) as f32;
+    (0..samples)
+        .map(|idx| {
+            let sampled_idx = (idx as f32 * step).round() as usize;
+            history
+                .get(sampled_idx.min(len.saturating_sub(1)))
+                .copied()
+                .unwrap_or(0.0)
+        })
+        .collect()
+}
+
+fn draw_audio_waveform(
+    ui: &mut egui::Ui,
+    history: &VecDeque<f32>,
+    current_level: f32,
+    phase: &str,
+    clipping: bool,
+) {
+    let desired_size = egui::vec2(ui.available_width(), 78.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let active = phase == "recording";
+
+    let background = if active {
+        egui::Color32::from_rgba_premultiplied(18, 28, 24, 225)
+    } else {
+        egui::Color32::from_rgba_premultiplied(22, 24, 30, 215)
+    };
+    painter.rect_filled(rect, egui::Rounding::same(7.0), background);
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::same(7.0),
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_premultiplied(180, 205, 235, 120),
+        ),
+    );
+
+    let center_y = rect.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 5.0, center_y),
+            egui::pos2(rect.right() - 5.0, center_y),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_premultiplied(120, 132, 150, 105),
+        ),
+    );
+
+    let bars = sample_meter_history(history, current_level, WAVE_BAR_COUNT);
+    let spacing = 1.5;
+    let inner_width = (rect.width() - 10.0).max(10.0);
+    let total_spacing = spacing * (WAVE_BAR_COUNT.saturating_sub(1) as f32);
+    let bar_width = ((inner_width - total_spacing) / WAVE_BAR_COUNT as f32).max(1.2);
+    let max_height = (rect.height() - 8.0).max(4.0);
+
+    for (idx, sample) in bars.iter().enumerate() {
+        let baseline = if active {
+            current_level.clamp(0.0, 1.0) * 0.08
+        } else {
+            0.0
+        };
+        let amplitude = sample.max(baseline).clamp(0.0, 1.0).powf(0.52);
+        if amplitude <= 0.01 {
+            continue;
+        }
+
+        let x = rect.left() + 5.0 + idx as f32 * (bar_width + spacing);
+        let height = (max_height * amplitude).max(3.0);
+        let bar_rect = egui::Rect::from_center_size(
+            egui::pos2(x + bar_width * 0.5, center_y),
+            egui::vec2(bar_width, height),
+        );
+
+        let color = if clipping {
+            egui::Color32::from_rgb(255, 88, 88)
+        } else if active {
+            let pulse = idx as f32 / (WAVE_BAR_COUNT.saturating_sub(1).max(1)) as f32;
+            let red = (90.0 + pulse * 40.0).round() as u8;
+            let green = (220.0 + pulse * 28.0).round() as u8;
+            let blue = (245.0 - pulse * 110.0).round() as u8;
+            egui::Color32::from_rgb(red, green, blue)
+        } else {
+            egui::Color32::from_rgb(145, 160, 185)
+        };
+
+        painter.rect_filled(bar_rect, bar_width * 0.5, color);
+    }
+
+    let time_s = ui.ctx().input(|i| i.time) as f32;
+    let trace_amp = if active {
+        (0.16 + current_level.clamp(0.0, 1.0) * 0.72).clamp(0.18, 0.9)
+    } else {
+        0.12
+    };
+    let mut points = Vec::with_capacity(96);
+    for idx in 0..96 {
+        let t = idx as f32 / 95.0;
+        let x = egui::lerp((rect.left() + 5.0)..=(rect.right() - 5.0), t);
+        let wave = (t * TAU * 4.0 + time_s * 6.2).sin();
+        let y = center_y - wave * (max_height * 0.42 * trace_amp);
+        points.push(egui::pos2(x, y));
+    }
+    let trace_colour = if clipping {
+        egui::Color32::from_rgb(255, 112, 112)
+    } else if active {
+        egui::Color32::from_rgb(255, 236, 120)
+    } else {
+        egui::Color32::from_rgb(172, 188, 209)
+    };
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(2.2, trace_colour),
+    ));
 }
 
 fn push_final_line(state: &mut OverlayState, line: String) {
@@ -1012,6 +1336,7 @@ fn apply_stream_event(state: &Arc<Mutex<OverlayState>>, stream_event: StreamEven
             guard.status_line = "Listening".to_string();
             guard.partial_text.clear();
             guard.meter_level = 0.0;
+            guard.meter_history.clear();
             guard.clipping = false;
         }
         "session_stopped" => {
@@ -1019,6 +1344,7 @@ fn apply_stream_event(state: &Arc<Mutex<OverlayState>>, stream_event: StreamEven
             guard.status_line = "Stopped".to_string();
             guard.partial_text.clear();
             guard.meter_level = 0.0;
+            guard.meter_history.clear();
             guard.clipping = false;
         }
         "partial" => {
@@ -1053,12 +1379,19 @@ fn apply_stream_event(state: &Arc<Mutex<OverlayState>>, stream_event: StreamEven
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            // Blend RMS and peak for a more responsive but stable UI meter.
-            let target = dbfs_to_level(rms).max(dbfs_to_level(peak) * 0.8);
+            // Use mostly RMS with some peak contribution so pauses visibly drop.
+            let rms_level = dbfs_to_level(rms);
+            let peak_level = dbfs_to_level(peak);
+            let target = (rms_level * 0.78 + peak_level * 0.22).clamp(0.0, 1.0);
             if target >= guard.meter_level {
-                guard.meter_level = guard.meter_level * 0.3 + target * 0.7;
+                guard.meter_level = guard.meter_level * 0.2 + target * 0.8;
             } else {
-                guard.meter_level = guard.meter_level * 0.82 + target * 0.18;
+                guard.meter_level = guard.meter_level * 0.58 + target * 0.42;
+            }
+            let level = guard.meter_level.clamp(0.0, 1.0);
+            guard.meter_history.push_back(level);
+            while guard.meter_history.len() > WAVE_HISTORY_CAP {
+                guard.meter_history.pop_front();
             }
             guard.clipping = clipping;
         }
@@ -1285,6 +1618,12 @@ fn run_sse_loop(url: String, state: Arc<Mutex<OverlayState>>) {
 }
 
 fn run() -> Result<(), DynError> {
+    let _instance_lock = match try_acquire_overlay_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
     let runtime_cfg = load_runtime_config();
     let state = Arc::new(Mutex::new(OverlayState::default()));
 
@@ -1297,11 +1636,16 @@ fn run() -> Result<(), DynError> {
             .map_err(|err| -> DynError { Box::new(err) })?;
     }
 
+    let window_width = runtime_cfg.width.max(460.0);
+    let window_height = runtime_cfg.height.max(300.0);
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Audetic Overlay")
         .with_app_id("audetic")
-        .with_inner_size(egui::vec2(runtime_cfg.width, runtime_cfg.height))
-        .with_min_inner_size(egui::vec2(380.0, 150.0));
+        .with_inner_size(egui::vec2(window_width, window_height))
+        .with_min_inner_size(egui::vec2(420.0, 260.0))
+        .with_visible(false)
+        .with_active(false);
 
     if runtime_cfg.always_on_top {
         viewport = viewport.with_always_on_top();
@@ -1364,6 +1708,25 @@ fn run() -> Result<(), DynError> {
     .map_err(|err| -> DynError { Box::new(err) })?;
 
     Ok(())
+}
+
+fn try_acquire_overlay_lock() -> Result<Option<File>, DynError> {
+    let data_dir =
+        audetic::global::data_dir().map_err(|err| std::io::Error::other(err.to_string()))?;
+    fs::create_dir_all(&data_dir)?;
+    let lock_path = data_dir.join("overlay.lock");
+
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn main() {

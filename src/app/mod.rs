@@ -2,8 +2,8 @@
 
 use crate::api::{ApiCommand, ApiServer};
 use crate::audio::{
-    AudioDuckingController, AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase,
-    RecordingStatusHandle, ToggleResult,
+    spawn_idle_level_monitor, AudioDuckingController, AudioStreamManager, BehaviorOptions,
+    RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
 };
 use crate::config::Config;
 use crate::streaming::{StreamHub, StreamingMachine};
@@ -82,6 +82,9 @@ pub async fn run_service() -> Result<()> {
             error!("API server failed: {}", e);
         }
     });
+
+    // Publish live mic level while idle so overlay waveform can behave like a real meter.
+    spawn_idle_level_monitor(status_handle.clone(), stream_hub.clone());
 
     spawn_update_manager();
 

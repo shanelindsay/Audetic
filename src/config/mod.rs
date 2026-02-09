@@ -178,7 +178,7 @@ impl Default for OverlayConfig {
             url: "http://127.0.0.1:3737/stream/events".to_string(),
             always_on_top: true,
             width: 560,
-            height: 220,
+            height: 300,
             opacity: 0.94,
             show_meter: true,
         }
