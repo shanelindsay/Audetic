@@ -6,6 +6,9 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const CLIP_THRESHOLD: f32 = 0.995;
+const CLIP_RATIO_THRESHOLD: f32 = 0.005;
+
 use crate::audio::{
     AudioStreamManager, BehaviorOptions, CompletedJob, JobOptions, RecordingPhase,
     RecordingStatusHandle, ToggleResult,
@@ -450,11 +453,15 @@ fn measure_level(samples: &[f32]) -> (f32, f32, bool) {
 
     let mut sum_sq = 0.0f64;
     let mut peak = 0.0f32;
+    let mut clip_count = 0usize;
 
     for &sample in samples {
         let abs = sample.abs();
         if abs > peak {
             peak = abs;
+        }
+        if abs >= CLIP_THRESHOLD {
+            clip_count += 1;
         }
         sum_sq += (sample as f64) * (sample as f64);
     }
@@ -462,7 +469,8 @@ fn measure_level(samples: &[f32]) -> (f32, f32, bool) {
     let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
     let rms_dbfs = 20.0 * rms.max(1e-9).log10();
     let peak_dbfs = 20.0 * peak.max(1e-9).log10();
-    let clipping = peak >= 0.99;
+    let clip_ratio = clip_count as f32 / samples.len() as f32;
+    let clipping = peak >= CLIP_THRESHOLD && clip_ratio >= CLIP_RATIO_THRESHOLD;
 
     (rms_dbfs, peak_dbfs, clipping)
 }

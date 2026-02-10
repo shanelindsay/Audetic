@@ -63,6 +63,9 @@ pub struct BehaviorConfig {
     pub audio_ducking: bool,
     #[serde(default = "default_ducking_level_percent")]
     pub ducking_level_percent: u8,
+    pub input_device: Option<String>,
+    #[serde(default = "default_input_gain_percent")]
+    pub input_gain_percent: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +100,10 @@ fn default_audio_feedback() -> bool {
 
 fn default_ducking_level_percent() -> u8 {
     35
+}
+
+fn default_input_gain_percent() -> u16 {
+    100
 }
 
 impl Default for WhisperConfig {
@@ -151,6 +158,8 @@ impl Default for BehaviorConfig {
             append_newline: false,
             audio_ducking: false,
             ducking_level_percent: default_ducking_level_percent(),
+            input_device: None,
+            input_gain_percent: default_input_gain_percent(),
         }
     }
 }

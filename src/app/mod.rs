@@ -22,7 +22,10 @@ pub async fn run_service() -> Result<()> {
     let config = Config::load()?;
 
     let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
-    let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::new()?));
+    let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::with_preferences(
+        config.behavior.input_device.as_deref(),
+        config.behavior.input_gain_percent,
+    )?));
     let stream_hub = Arc::new(StreamHub::new());
 
     let text_io = TextIoService::new(
@@ -94,7 +97,12 @@ pub async fn run_service() -> Result<()> {
     });
 
     // Publish live mic level while idle so overlay waveform can behave like a real meter.
-    spawn_idle_level_monitor(status_handle.clone(), stream_hub.clone());
+    spawn_idle_level_monitor(
+        status_handle.clone(),
+        stream_hub.clone(),
+        config.behavior.input_device.clone(),
+        config.behavior.input_gain_percent,
+    );
 
     spawn_update_manager();
 

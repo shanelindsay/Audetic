@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
 
-use crate::audio::select_input_device_any_host;
+use crate::audio::select_input_device_any_host_with_preference;
 
 /// State of the audio recording session
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,6 +24,7 @@ pub struct AudioStreamManager {
     sample_format: cpal::SampleFormat,
     sample_rate_hz: u32,
     channels: usize,
+    input_gain: f32,
     samples: Arc<Mutex<Vec<f32>>>,
     active_stream: Arc<Mutex<Option<cpal::Stream>>>,
     state: Arc<Mutex<RecordingState>>,
@@ -32,9 +33,19 @@ pub struct AudioStreamManager {
 impl AudioStreamManager {
     /// Create a new audio stream manager
     pub fn new() -> Result<Self> {
-        let device = select_input_device_any_host().context("No input device available")?;
+        Self::with_preferences(None, 100)
+    }
 
-        info!("Using audio device: {}", device.name()?);
+    pub fn with_preferences(preferred_input_device: Option<&str>, input_gain_percent: u16) -> Result<Self> {
+        let device = select_input_device_any_host_with_preference(preferred_input_device)
+            .context("No input device available")?;
+
+        let input_gain = (input_gain_percent as f32 / 100.0).clamp(0.25, 3.0);
+        info!(
+            "Using audio device: {} (input_gain={}%)",
+            device.name()?,
+            (input_gain * 100.0).round() as u16
+        );
 
         let input_config = device.default_input_config()?;
         let config = input_config.config();
@@ -47,6 +58,7 @@ impl AudioStreamManager {
             sample_format: input_config.sample_format(),
             sample_rate_hz,
             channels,
+            input_gain,
             samples: Arc::new(Mutex::new(Vec::new())),
             active_stream: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
@@ -89,11 +101,12 @@ impl AudioStreamManager {
             cpal::SampleFormat::F32 => {
                 let samples_clone = self.samples.clone();
                 let channels = self.channels;
+                let input_gain = self.input_gain;
                 self.device.build_input_stream(
                     &self.config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut samples) = samples_clone.lock() {
-                            extend_mono_from_f32(data, channels, &mut samples);
+                            extend_mono_from_f32(data, channels, input_gain, &mut samples);
                         }
                     },
                     err_fn,
@@ -103,11 +116,12 @@ impl AudioStreamManager {
             cpal::SampleFormat::I16 => {
                 let samples_clone = self.samples.clone();
                 let channels = self.channels;
+                let input_gain = self.input_gain;
                 self.device.build_input_stream(
                     &self.config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut samples) = samples_clone.lock() {
-                            extend_mono_from_i16(data, channels, &mut samples);
+                            extend_mono_from_i16(data, channels, input_gain, &mut samples);
                         }
                     },
                     err_fn,
@@ -117,11 +131,12 @@ impl AudioStreamManager {
             cpal::SampleFormat::U16 => {
                 let samples_clone = self.samples.clone();
                 let channels = self.channels;
+                let input_gain = self.input_gain;
                 self.device.build_input_stream(
                     &self.config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut samples) = samples_clone.lock() {
-                            extend_mono_from_u16(data, channels, &mut samples);
+                            extend_mono_from_u16(data, channels, input_gain, &mut samples);
                         }
                     },
                     err_fn,
@@ -262,21 +277,27 @@ impl Drop for AudioStreamManager {
     }
 }
 
-fn extend_mono_from_f32(input: &[f32], channels: usize, out: &mut Vec<f32>) {
+fn extend_mono_from_f32(input: &[f32], channels: usize, input_gain: f32, out: &mut Vec<f32>) {
     if channels <= 1 {
-        out.extend_from_slice(input);
+        out.extend(
+            input
+                .iter()
+                .map(|sample| (sample * input_gain).clamp(-1.0, 1.0)),
+        );
         return;
     }
 
     for frame in input.chunks(channels) {
         let sum: f32 = frame.iter().copied().sum();
-        out.push(sum / frame.len() as f32);
+        out.push(((sum / frame.len() as f32) * input_gain).clamp(-1.0, 1.0));
     }
 }
 
-fn extend_mono_from_i16(input: &[i16], channels: usize, out: &mut Vec<f32>) {
+fn extend_mono_from_i16(input: &[i16], channels: usize, input_gain: f32, out: &mut Vec<f32>) {
     if channels <= 1 {
-        out.extend(input.iter().map(|sample| *sample as f32 / i16::MAX as f32));
+        out.extend(input.iter().map(|sample| {
+            ((*sample as f32 / i16::MAX as f32) * input_gain).clamp(-1.0, 1.0)
+        }));
         return;
     }
 
@@ -285,16 +306,16 @@ fn extend_mono_from_i16(input: &[i16], channels: usize, out: &mut Vec<f32>) {
             .iter()
             .map(|sample| *sample as f32 / i16::MAX as f32)
             .sum();
-        out.push(sum / frame.len() as f32);
+        out.push(((sum / frame.len() as f32) * input_gain).clamp(-1.0, 1.0));
     }
 }
 
-fn extend_mono_from_u16(input: &[u16], channels: usize, out: &mut Vec<f32>) {
+fn extend_mono_from_u16(input: &[u16], channels: usize, input_gain: f32, out: &mut Vec<f32>) {
     if channels <= 1 {
         out.extend(
             input
                 .iter()
-                .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0),
+                .map(|sample| (((*sample as f32 / u16::MAX as f32) * 2.0 - 1.0) * input_gain).clamp(-1.0, 1.0)),
         );
         return;
     }
@@ -304,7 +325,7 @@ fn extend_mono_from_u16(input: &[u16], channels: usize, out: &mut Vec<f32>) {
             .iter()
             .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
             .sum();
-        out.push(sum / frame.len() as f32);
+        out.push(((sum / frame.len() as f32) * input_gain).clamp(-1.0, 1.0));
     }
 }
 

@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use audetic::audio::{best_available_input_device_name, preferred_input_device_name};
+use audetic::audio::{
+    available_input_device_names, best_available_input_device_name_with_preference,
+    preferred_input_device_name, selected_input_device_name,
+};
 use audetic::config::{Config, OverlayConfig};
 use audetic::streaming::events::StreamEvent;
 use eframe::egui;
@@ -19,8 +22,8 @@ type DynError = Box<dyn std::error::Error>;
 const WAVE_HISTORY_CAP: usize = 260;
 const WAVE_BAR_COUNT: usize = 64;
 const OVERLAY_HIDE_DELAY_MS: u64 = 1300;
-const METER_FLOOR_DBFS: f32 = -58.0;
-const METER_GATE_DBFS: f32 = -52.0;
+const METER_FLOOR_DBFS: f32 = -68.0;
+const METER_GATE_DBFS: f32 = -56.0;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct OutputModeState {
@@ -70,6 +73,9 @@ struct OverlayApp {
     batch_model_label: String,
     batch_source_label: String,
     mic_label: String,
+    selected_input_device: Option<String>,
+    available_input_devices: Vec<String>,
+    input_gain_percent: u16,
     control_mode: InputControlMode,
     copy_to_clipboard: bool,
     auto_paste: bool,
@@ -105,6 +111,9 @@ struct OverlayAppUiConfig {
     batch_model_label: String,
     batch_source_label: String,
     mic_label: String,
+    selected_input_device: Option<String>,
+    available_input_devices: Vec<String>,
+    input_gain_percent: u16,
     control_mode: InputControlMode,
     ptt_activation_delay_ms: u64,
     copy_to_clipboard: bool,
@@ -201,6 +210,9 @@ impl OverlayApp {
             batch_model_label: ui_cfg.batch_model_label,
             batch_source_label: ui_cfg.batch_source_label,
             mic_label: ui_cfg.mic_label,
+            selected_input_device: ui_cfg.selected_input_device,
+            available_input_devices: ui_cfg.available_input_devices,
+            input_gain_percent: ui_cfg.input_gain_percent,
             control_mode: ui_cfg.control_mode,
             copy_to_clipboard: ui_cfg.copy_to_clipboard,
             auto_paste: ui_cfg.auto_paste,
@@ -330,6 +342,13 @@ impl OverlayApp {
         }
     }
 
+    fn refresh_mic_label(&mut self) {
+        let preferred = self.selected_input_device.as_deref();
+        self.mic_label = detect_active_mic_name(preferred)
+            .map(|name| short_mic_label(&name, 24))
+            .unwrap_or_else(|| "System default".to_string());
+    }
+
     fn save_settings(&mut self) {
         let update = OverlaySettingsUpdate {
             control_mode: self.control_mode,
@@ -339,6 +358,8 @@ impl OverlayApp {
             audio_ducking: self.audio_ducking,
             ducking_level_percent: self.ducking_level_percent,
             preserve_clipboard: self.preserve_clipboard,
+            input_device: self.selected_input_device.clone(),
+            input_gain_percent: self.input_gain_percent,
         };
         persist_overlay_settings(update, self.state.clone());
     }
@@ -434,7 +455,7 @@ struct OverlayUiState {
     show_meter: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct OverlaySettingsUpdate {
     control_mode: InputControlMode,
     ptt_activation_delay_ms: u64,
@@ -443,6 +464,8 @@ struct OverlaySettingsUpdate {
     audio_ducking: bool,
     ducking_level_percent: u8,
     preserve_clipboard: bool,
+    input_device: Option<String>,
+    input_gain_percent: u16,
 }
 
 fn overlay_ui_state_path() -> Option<PathBuf> {
@@ -696,6 +719,75 @@ impl eframe::App for OverlayApp {
                                     });
 
                                     ui.horizontal(|ui| {
+                                        ui.label("Input device:");
+                                        let selected_label = self
+                                            .selected_input_device
+                                            .as_deref()
+                                            .unwrap_or("System default");
+                                        let available_devices =
+                                            self.available_input_devices.clone();
+                                        egui::ComboBox::from_id_salt("audetic-input-device")
+                                            .selected_text(selected_label)
+                                            .width(260.0)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.selected_input_device.is_none(),
+                                                        "System default",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.selected_input_device = None;
+                                                    self.refresh_mic_label();
+                                                    options_changed = true;
+                                                }
+
+                                                for device in &available_devices {
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.selected_input_device
+                                                                .as_deref()
+                                                                == Some(device.as_str()),
+                                                            device,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.selected_input_device =
+                                                            Some(device.clone());
+                                                        self.refresh_mic_label();
+                                                        options_changed = true;
+                                                    }
+                                                }
+                                            });
+                                        if ui.button("Rescan").clicked() {
+                                            self.available_input_devices =
+                                                available_input_device_names();
+                                            if self
+                                                .selected_input_device
+                                                .as_deref()
+                                                .is_some_and(|selected| {
+                                                    !self
+                                                        .available_input_devices
+                                                        .iter()
+                                                        .any(|name| name == selected)
+                                                })
+                                            {
+                                                self.selected_input_device = None;
+                                            }
+                                            self.refresh_mic_label();
+                                        }
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Input gain:");
+                                        let gain_slider = ui.add(
+                                            egui::Slider::new(&mut self.input_gain_percent, 25..=300)
+                                                .suffix(" %"),
+                                        );
+                                        options_changed |= gain_slider.changed();
+                                    });
+
+                                    ui.horizontal(|ui| {
                                         let meter_toggle =
                                             ui.checkbox(&mut self.show_meter, "Show mic meter");
                                         ui.label("Overlay opacity:");
@@ -856,6 +948,9 @@ struct OverlayRuntimeConfig {
     batch_model_label: String,
     batch_source_label: String,
     mic_label: String,
+    selected_input_device: Option<String>,
+    available_input_devices: Vec<String>,
+    input_gain_percent: u16,
     control_mode: InputControlMode,
     ptt_activation_delay_ms: u64,
     copy_to_clipboard: bool,
@@ -897,9 +992,18 @@ impl OverlayRuntimeConfig {
             .clone()
             .unwrap_or_else(|| "<default>".to_string());
         let batch_source_label = provider_source_label(&batch_provider).to_string();
-        let mic_label = detect_active_mic_name()
-            .map(|name| short_mic_label(&name, 12))
-            .unwrap_or_else(|| "Default".to_string());
+        let selected_input_device = config
+            .behavior
+            .input_device
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string);
+        let available_input_devices = available_input_device_names();
+        let input_gain_percent = config.behavior.input_gain_percent.clamp(25, 300);
+        let mic_label = detect_active_mic_name(selected_input_device.as_deref())
+            .map(|name| short_mic_label(&name, 24))
+            .unwrap_or_else(|| "System default".to_string());
 
         let mut runtime = Self {
             url: overlay_cfg.url.clone(),
@@ -912,6 +1016,9 @@ impl OverlayRuntimeConfig {
             batch_model_label,
             batch_source_label,
             mic_label,
+            selected_input_device,
+            available_input_devices,
+            input_gain_percent,
             control_mode: InputControlMode::Toggle,
             ptt_activation_delay_ms: 260,
             copy_to_clipboard: true,
@@ -960,7 +1067,12 @@ impl OverlayRuntimeConfig {
             streaming_source_label: "API".to_string(),
             batch_model_label: "base".to_string(),
             batch_source_label: "Local".to_string(),
-            mic_label: "Default".to_string(),
+            mic_label: detect_active_mic_name(None)
+                .map(|name| short_mic_label(&name, 24))
+                .unwrap_or_else(|| "System default".to_string()),
+            selected_input_device: None,
+            available_input_devices: available_input_device_names(),
+            input_gain_percent: 100,
             control_mode: InputControlMode::Toggle,
             ptt_activation_delay_ms: 260,
             copy_to_clipboard: true,
@@ -1046,8 +1158,15 @@ fn short_mic_label(name: &str, max_chars: usize) -> String {
     name.chars().take(max_chars).collect()
 }
 
-fn detect_active_mic_name() -> Option<String> {
-    if let Some(name) = best_available_input_device_name() {
+fn detect_active_mic_name(preferred_input_device: Option<&str>) -> Option<String> {
+    if let Some(name) = selected_input_device_name(preferred_input_device) {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(name) = best_available_input_device_name_with_preference(preferred_input_device) {
         let trimmed = name.trim();
         if !trimmed.is_empty() && !is_placeholder_device_name(trimmed) {
             return Some(trimmed.to_string());
@@ -1121,6 +1240,13 @@ fn persist_overlay_settings(update: OverlaySettingsUpdate, state: Arc<Mutex<Over
         config.behavior.audio_ducking = update.audio_ducking;
         config.behavior.ducking_level_percent = update.ducking_level_percent.clamp(5, 95);
         config.behavior.preserve_clipboard = update.preserve_clipboard;
+        config.behavior.input_device = update
+            .input_device
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string);
+        config.behavior.input_gain_percent = update.input_gain_percent.clamp(25, 300);
         config
             .save()
             .map_err(|err| format!("Failed to save config: {err}"))?;
@@ -1173,7 +1299,7 @@ fn dbfs_to_level(dbfs: f32) -> f32 {
         return 0.0;
     }
     let normalized = (dbfs - METER_FLOOR_DBFS) / (0.0 - METER_FLOOR_DBFS);
-    normalized.clamp(0.0, 1.0).powf(1.25)
+    normalized.clamp(0.0, 1.0).powf(1.55)
 }
 
 fn sample_meter_history(history: &VecDeque<f32>, current_level: f32, samples: usize) -> Vec<f32> {
@@ -1250,11 +1376,11 @@ fn draw_audio_waveform(
 
     for (idx, sample) in bars.iter().enumerate() {
         let baseline = if active {
-            current_level.clamp(0.0, 1.0) * 0.08
+            current_level.clamp(0.0, 1.0) * 0.02
         } else {
             0.0
         };
-        let amplitude = sample.max(baseline).clamp(0.0, 1.0).powf(0.52);
+        let amplitude = sample.max(baseline).clamp(0.0, 1.0).powf(0.82);
         if amplitude <= 0.01 {
             continue;
         }
@@ -1661,6 +1787,9 @@ fn run() -> Result<(), DynError> {
     let batch_model_label = runtime_cfg.batch_model_label.clone();
     let batch_source_label = runtime_cfg.batch_source_label.clone();
     let mic_label = runtime_cfg.mic_label.clone();
+    let selected_input_device = runtime_cfg.selected_input_device.clone();
+    let available_input_devices = runtime_cfg.available_input_devices.clone();
+    let input_gain_percent = runtime_cfg.input_gain_percent;
     let control_mode = runtime_cfg.control_mode;
     let ptt_activation_delay_ms = runtime_cfg.ptt_activation_delay_ms;
     let copy_to_clipboard = runtime_cfg.copy_to_clipboard;
@@ -1684,6 +1813,9 @@ fn run() -> Result<(), DynError> {
                 batch_model_label: batch_model_label.clone(),
                 batch_source_label: batch_source_label.clone(),
                 mic_label: mic_label.clone(),
+                selected_input_device: selected_input_device.clone(),
+                available_input_devices: available_input_devices.clone(),
+                input_gain_percent,
                 control_mode,
                 ptt_activation_delay_ms,
                 copy_to_clipboard,
