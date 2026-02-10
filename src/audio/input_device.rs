@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -104,24 +105,7 @@ fn preferred_match_index(candidates: &[DeviceCandidate], preferred_name: &str) -
         })
 }
 
-fn pick_candidate_index(
-    candidates: &[DeviceCandidate],
-    default_name: Option<&str>,
-    preferred_name: Option<&str>,
-) -> Option<usize> {
-    if let Some(preferred) = preferred_name.and_then(|name| {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    }) {
-        if let Some(idx) = preferred_match_index(candidates, preferred) {
-            return Some(idx);
-        }
-    }
-
+fn pick_candidate_index(candidates: &[DeviceCandidate], default_name: Option<&str>) -> Option<usize> {
     if let Some(default_name) = default_name.and_then(|name| {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -164,7 +148,21 @@ fn select_input_device_on_host(
         .map(|name| name.trim().to_string());
 
     let mut candidates = enumerate_host_input_candidates(host)?;
-    let idx = pick_candidate_index(&candidates, default_name.as_deref(), preferred_name)
+    if let Some(preferred) = preferred_name.and_then(|name| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        let idx = preferred_match_index(&candidates, preferred).ok_or_else(|| {
+            anyhow!("Preferred input device '{preferred}' not found on this host")
+        })?;
+        return Ok(candidates.swap_remove(idx).device);
+    }
+
+    let idx = pick_candidate_index(&candidates, default_name.as_deref())
         .ok_or_else(|| anyhow!("No input device available"))?;
 
     Ok(candidates.swap_remove(idx).device)
@@ -182,9 +180,25 @@ pub fn select_input_device_any_host_with_preference(
     preferred_name: Option<&str>,
 ) -> Result<cpal::Device> {
     let mut fallback: Option<cpal::Device> = None;
+    let preferred_name = preferred_name.and_then(|name| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    if let Some(preferred) = preferred_name {
+        for host in available_hosts_in_priority_order() {
+            if let Ok(device) = select_input_device_on_host(&host, Some(preferred)) {
+                return Ok(device);
+            }
+        }
+    }
 
     for host in available_hosts_in_priority_order() {
-        if let Ok(device) = select_input_device_on_host(&host, preferred_name) {
+        if let Ok(device) = select_input_device_on_host(&host, None) {
             return Ok(device);
         }
 
@@ -223,6 +237,34 @@ pub fn best_available_input_device_name_with_preference(
     selected_input_device_name(preferred_name)
 }
 
+fn arecord_input_device_names() -> Vec<String> {
+    let output = match Command::new("arecord").arg("-L").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| !line.starts_with("null"))
+        .filter(|line| !line.starts_with("default"))
+        .filter(|line| !line.starts_with("pulse"))
+        .filter(|line| !line.starts_with("pipewire"))
+        .filter(|line| {
+            line.starts_with("sysdefault:")
+                || line.starts_with("front:")
+                || line.starts_with("hw:")
+                || line.starts_with("plughw:")
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
 pub fn available_input_device_names() -> Vec<String> {
     let mut names = BTreeSet::new();
 
@@ -231,11 +273,15 @@ pub fn available_input_device_names() -> Vec<String> {
             continue;
         };
         for candidate in candidates {
-            if candidate.is_routing || candidate.is_monitor {
+            if candidate.is_monitor {
                 continue;
             }
             names.insert(candidate.name);
         }
+    }
+
+    for alsa_name in arecord_input_device_names() {
+        names.insert(alsa_name);
     }
 
     names.into_iter().collect()
